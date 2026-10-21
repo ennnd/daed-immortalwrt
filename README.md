@@ -85,7 +85,8 @@ Makefile 里几个关键点：
 sudo apt update
 sudo apt install -y build-essential gcc g++ binutils patch bzip2 flex bison make \
   autoconf gettext texinfo unzip sharutils libncurses-dev zlib1g-dev gawk git \
-  rsync python3 python3-setuptools wget curl zstd bc libssl-dev
+  rsync python3 python3-setuptools python3-dev python3-pyelftools \
+  wget curl zstd bc libssl-dev swig cpio time
 ```
 
 资源建议：**4 核 CPU 以上、8 GB 内存、30 GB 以上空闲磁盘**（SDK 路线约 10–15 GB）。
@@ -142,7 +143,13 @@ ls -l llvm-bpf/.llvm-version
 
 ```bash
 ./scripts/feeds update -a
-./scripts/feeds install -a
+
+# 不要用 install -a：它会把 perl/uboot 等无关包也装进来，
+# 这些包的全局 prereq 检查（rsync、python3-pyelftools）会让
+# make package/daed/compile 在真正开始前就失败。
+for p in bpf-headers ca-certificates golang golang1.26 golang-bootstrap v2ray-geodata; do
+	./scripts/feeds install -f "$p"
+done
 ```
 
 ### 5.3 放入 daed 2.1.1 包
@@ -164,22 +171,37 @@ sh /home/you/daed-immortalwrt/scripts/install-package.sh "$PWD"
 ```bash
 make defconfig
 
-# 选“预编译 LLVM 工具链”，并打开 daed
-sed -i -e 's/^CONFIG_BPF_TOOLCHAIN_NONE=y/# CONFIG_BPF_TOOLCHAIN_NONE is not set/' \
-       -e 's/^CONFIG_BPF_TOOLCHAIN_BUILD_LLVM=y/# CONFIG_BPF_TOOLCHAIN_BUILD_LLVM is not set/' \
-       -e 's/^CONFIG_BPF_TOOLCHAIN_HOST=y/# CONFIG_BPF_TOOLCHAIN_HOST is not set/' .config
+# SDK 默认可能带 CONFIG_ALL_*（全选 uboot/perl 等无关包），
+# 会让 make package/daed/compile 先对一堆无关包做 host 依赖检查。
+# 关掉它们，同时选“预编译 LLVM 工具链”。
+sed -i \
+  -e 's/^CONFIG_BUILDBOT=y/# CONFIG_BUILDBOT is not set/' \
+  -e 's/^CONFIG_ALL=y/# CONFIG_ALL is not set/' \
+  -e 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' \
+  -e 's/^CONFIG_ALL_NONSHARED=y/# CONFIG_ALL_NONSHARED is not set/' \
+  -e 's/^CONFIG_TARGET_ALL_PROFILES=y/# CONFIG_TARGET_ALL_PROFILES is not set/' \
+  -e 's/^CONFIG_BPF_TOOLCHAIN_NONE=y/# CONFIG_BPF_TOOLCHAIN_NONE is not set/' \
+  -e 's/^CONFIG_BPF_TOOLCHAIN_BUILD_LLVM=y/# CONFIG_BPF_TOOLCHAIN_BUILD_LLVM is not set/' \
+  -e 's/^CONFIG_BPF_TOOLCHAIN_HOST=y/# CONFIG_BPF_TOOLCHAIN_HOST is not set/' \
+  .config
 
 cat >> .config <<'EOF'
 CONFIG_BPF_TOOLCHAIN_PREBUILT=y
 CONFIG_PACKAGE_daed=y
 CONFIG_PACKAGE_daed-geoip=y
 CONFIG_PACKAGE_daed-geosite=y
+CONFIG_PACKAGE_kmod-sched-core=y
+CONFIG_PACKAGE_kmod-sched-bpf=y
+CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
+CONFIG_PACKAGE_kmod-veth=y
 EOF
 
 make defconfig
 
 # 检查结果：必须有 PREBUILT=y 和 PACKAGE_daed=y
-grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed)' .config
+grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed|PACKAGE_kmod-sched|PACKAGE_kmod-veth|PACKAGE_kmod-xdp)' .config
+# ALL_* 应该都是 not set
+grep -E '^CONFIG_(ALL|ALL_KMODS|ALL_NONSHARED|BUILDBOT)' .config || true
 ```
 
 如果 `CONFIG_BPF_TOOLCHAIN_PREBUILT` 没生效，可以在 `make menuconfig` 里按 `/` 搜索
@@ -189,6 +211,7 @@ grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed)' .config
 
 ```bash
 make -j$(nproc) package/daed/compile V=s
+make -j$(nproc) package/daed-geoip/compile package/daed-geosite/compile V=s
 ```
 
 第一次还会顺带编译 host 端的 Go 1.26 和 `bpf-headers`，再编 daed，大约 20–40 分钟。
@@ -403,6 +426,8 @@ wget -qO- http://127.0.0.1:2023/ | head -c 200
 | `go.mod requires go >= 1.26.0` | 25.12 默认 Go 1.26，正常；若用老分支，把 Makefile 里 `golang/host` 改成 `golang1.26/host`，并确认 feed 里有 `golang1.26` |
 | `fatal: unable to access 'https://github.com/...'` | 子模块克隆失败。检查网络/代理；重跑 `make package/daed/download V=s` |
 | `go: command not found` / 找不到 bpf-headers | 先跑 `make package/golang/host/compile` 和 `make package/bpf-headers/compile`，再编 daed |
+| `u-boot: Please install the Python3 elftools module` | 装 `python3-pyelftools`，或 `pip3 install --break-system-packages pyelftools` |
+| `package/feeds/packages/perl failed to build`（卡在 prereq） | 不要 `feeds install -a`，按 5.2 只装 `bpf-headers ca-certificates golang golang1.26 golang-bootstrap v2ray-geodata`；perl/uboot 的全局 prereq 就不会被触发 |
 | `ERROR: package 'bpf-headers' is not available` | 没执行 `./scripts/feeds update -a && ./scripts/feeds install -a`；SDK 的 base feed 提供 bpf-headers |
 | `clang: not found` / `LLVM/clang version too old` | 没解压 `llvm-bpf-21.1.6...tar.zst`，或没选 `CONFIG_BPF_TOOLCHAIN_PREBUILT=y` |
 | `pattern web: no matching files found` | web.zip 没解压成功/缓存损坏。删 `build_dir/target-*/daed-2.1.1` 和 `dl/daed-web-2.1.1.zip` 重来 |

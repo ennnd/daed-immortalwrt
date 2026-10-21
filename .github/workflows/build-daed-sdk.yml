@@ -40,7 +40,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential gcc g++ binutils patch bzip2 flex bison make \
             autoconf gettext texinfo unzip sharutils libncurses-dev zlib1g-dev \
-            gawk git rsync python3 python3-setuptools wget curl zstd bc libssl-dev
+            gawk git rsync python3 python3-setuptools python3-dev python3-pyelftools \
+            wget curl zstd bc libssl-dev swig cpio time
+          # 某些镜像没有 python3-pyelftools 包，兜底用 pip
+          python3 -c 'import elftools' 2>/dev/null || \
+            pip3 install --break-system-packages pyelftools
+          command -v rsync >/dev/null || sudo apt-get install -y rsync
 
       - name: Download SDK and llvm-bpf
         run: |
@@ -50,13 +55,23 @@ jobs:
           curl -fL --retry 5 --retry-delay 5 -o llvm-bpf.tar.zst "${BASE}/${LLVM_BPF}"
           tar --zstd -xf sdk.tar.zst
           tar --zstd -xf llvm-bpf.tar.zst -C "${SDK_NAME}"
+
+          # 兼容 tarball 顶层目录名不是 llvm-bpf/ 的情况
+          if [ ! -d "${SDK_NAME}/llvm-bpf" ]; then
+            d=$(find "${SDK_NAME}" -maxdepth 1 -type d -name 'llvm-bpf*' | head -n1)
+            [ -n "$d" ] && ln -s "$(basename "$d")" "${SDK_NAME}/llvm-bpf"
+          fi
           test -f "${SDK_NAME}/llvm-bpf/.llvm-version"
 
       - name: Update feeds
         run: |
           cd "${SDK_NAME}"
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          # 不要用 install -a：会把 perl/uboot 等无关包也装进来，
+          # 它们的全局 prereq 检查（rsync、python3-pyelftools）会拖垮构建。
+          for p in bpf-headers ca-certificates golang golang1.26 golang-bootstrap v2ray-geodata; do
+            ./scripts/feeds install -f "$p"
+          done
 
       - name: Install daed package
         run: |
@@ -67,24 +82,46 @@ jobs:
         run: |
           cd "${SDK_NAME}"
           make defconfig
+
+          # SDK 的默认配置可能带 CONFIG_ALL_*（全选 uboot/perl 等包），
+          # 这样 make package/daed/compile 会先对一堆无关包做 host 依赖检查。
+          # 关掉它们，让 prereq 只检查 daed 及其依赖。
           sed -i \
+            -e 's/^CONFIG_BUILDBOT=y/# CONFIG_BUILDBOT is not set/' \
+            -e 's/^CONFIG_ALL=y/# CONFIG_ALL is not set/' \
+            -e 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' \
+            -e 's/^CONFIG_ALL_NONSHARED=y/# CONFIG_ALL_NONSHARED is not set/' \
+            -e 's/^CONFIG_TARGET_ALL_PROFILES=y/# CONFIG_TARGET_ALL_PROFILES is not set/' \
             -e 's/^CONFIG_BPF_TOOLCHAIN_NONE=y/# CONFIG_BPF_TOOLCHAIN_NONE is not set/' \
             -e 's/^CONFIG_BPF_TOOLCHAIN_BUILD_LLVM=y/# CONFIG_BPF_TOOLCHAIN_BUILD_LLVM is not set/' \
             -e 's/^CONFIG_BPF_TOOLCHAIN_HOST=y/# CONFIG_BPF_TOOLCHAIN_HOST is not set/' \
             .config
+
           {
             echo 'CONFIG_BPF_TOOLCHAIN_PREBUILT=y'
             echo 'CONFIG_PACKAGE_daed=y'
             echo 'CONFIG_PACKAGE_daed-geoip=y'
             echo 'CONFIG_PACKAGE_daed-geosite=y'
+            echo 'CONFIG_PACKAGE_kmod-sched-core=y'
+            echo 'CONFIG_PACKAGE_kmod-sched-bpf=y'
+            echo 'CONFIG_PACKAGE_kmod-xdp-sockets-diag=y'
+            echo 'CONFIG_PACKAGE_kmod-veth=y'
           } >> .config
+
           make defconfig
-          grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed)' .config
+          echo "---- check ----"
+          grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed|PACKAGE_kmod-sched|PACKAGE_kmod-veth|PACKAGE_kmod-xdp)' .config
+          echo "---- ALL_* should be off ----"
+          grep -E '^CONFIG_(ALL|ALL_KMODS|ALL_NONSHARED|BUILDBOT)' .config || true
+
+          grep -q '^CONFIG_PACKAGE_daed=y' .config || { echo "ERROR: daed 没有被选中"; exit 1; }
+          grep -q '^CONFIG_BPF_TOOLCHAIN_PREBUILT=y' .config || { echo "ERROR: BPF 工具链不是 prebuilt"; exit 1; }
 
       - name: Build daed
         run: |
           cd "${SDK_NAME}"
           make -j"$(nproc)" package/daed/compile V=s
+          make -j"$(nproc)" package/daed-geoip/compile package/daed-geosite/compile V=s
 
       - name: Collect packages
         run: |
