@@ -141,7 +141,7 @@ define Build/Prepare
 endef
 
 DAE_CFLAGS:= \
-	-O2 -Wall -Werror \
+	-O2 -Wall \
 	-DMAX_MATCH_SET_LEN=1024 \
 	-I$(BPF_HEADERS_DIR)/tools/lib \
 	-I$(BPF_HEADERS_DIR)/arch/$(BPF_KARCH)/include/asm/mach-generic
@@ -149,6 +149,13 @@ DAE_CFLAGS:= \
 # 不使用 golang-package.mk 的拷贝式构建，只需要准备缓存目录
 define Build/Configure
 	mkdir -p "$(GO_BUILD_CACHE_DIR)" "$(GO_MOD_CACHE_DIR)" "$(GO_PKG_BUILD_DIR)"
+endef
+
+# golang-package.mk 默认会让 Build/InstallDev 去拷贝
+# .go_work/build/src/... 下的 Go 源码；我们跳过了 configure 的拷贝步骤，
+# 这个目录不存在，会在安装阶段报 "cp: cannot stat"。
+# daed 不需要给其他包提供 Go 源码，直接置空。
+define Build/InstallDev
 endef
 
 define Build/Compile

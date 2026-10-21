@@ -425,6 +425,7 @@ wget -qO- http://127.0.0.1:2023/ | head -c 200
 | `go.mod requires go >= 1.26.0` | 25.12 默认 Go 1.26，正常；若用老分支，把 Makefile 里 `golang/host` 改成 `golang1.26/host`，并确认 feed 里有 `golang1.26` |
 | `fatal: unable to access 'https://github.com/...'` | 子模块克隆失败。检查网络/代理；重跑 `make package/daed/download V=s` |
 | `go: command not found` / 找不到 bpf-headers | 先跑 `make package/golang/host/compile` 和 `make package/bpf-headers/compile`，再编 daed |
+| `cp: cannot stat '.../.go_work/build/src/github.com/daeuniverse/dae-wing'` | 跳过了 Go 的拷贝式 configure，但 `Build/InstallDev` 默认仍去拷源码。Makefile 里已用空的 `Build/InstallDev` 关掉 |
 | `u-boot: Please install the Python3 elftools module` | 装 `python3-pyelftools`，或 `pip3 install --break-system-packages pyelftools` |
 | `package/feeds/packages/perl failed to build`（卡在 prereq） | 不要 `feeds install -a`，按 5.2 只装 `bpf-headers ca-certificates golang golang1.26 golang-bootstrap v2ray-geodata`；perl/uboot 的全局 prereq 就不会被触发 |
 | `ERROR: package 'bpf-headers' is not available` | 没执行 `./scripts/feeds update -a && ./scripts/feeds install -a`；SDK 的 base feed 提供 bpf-headers |
