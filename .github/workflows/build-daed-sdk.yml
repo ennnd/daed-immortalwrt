@@ -34,6 +34,16 @@ jobs:
       - name: Show disk before
         run: df -h
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          docker image prune -af || true
+          df -h
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -69,7 +79,7 @@ jobs:
           ./scripts/feeds update -a
           # 不要用 install -a：会把 perl/uboot 等无关包也装进来，
           # 它们的全局 prereq 检查（rsync、python3-pyelftools）会拖垮构建。
-          for p in bpf-headers ca-certificates golang golang1.26 golang-bootstrap v2ray-geodata; do
+          for p in bpf-headers ca-certificates golang golang1.26 golang-bootstrap; do
             ./scripts/feeds install -f "$p"
           done
 
@@ -104,8 +114,6 @@ jobs:
 
           {
             echo 'CONFIG_PACKAGE_daed=y'
-            echo 'CONFIG_PACKAGE_daed-geoip=y'
-            echo 'CONFIG_PACKAGE_daed-geosite=y'
             echo 'CONFIG_PACKAGE_kmod-sched-core=y'
             echo 'CONFIG_PACKAGE_kmod-sched-bpf=y'
             echo 'CONFIG_PACKAGE_kmod-xdp-sockets-diag=y'
@@ -133,14 +141,23 @@ jobs:
       - name: Build daed
         run: |
           cd "${SDK_NAME}"
-          make -j"$(nproc)" package/daed/compile V=s
-          make -j"$(nproc)" package/daed-geoip/compile package/daed-geosite/compile V=s
+          set -o pipefail
+          # 三个二进制包都来自 package/daed/，所以只有这一个 target
+          make -j"$(nproc)" package/daed/compile V=s 2>&1 | tee /tmp/daed-build.log
+
+      - name: Error summary
+        if: failure()
+        run: |
+          echo "===== first errors ====="
+          grep -n -m 20 -E 'error:|ERROR:|Error [0-9]|failed|No such file|not found' /tmp/daed-build.log || true
+          echo "===== last 150 lines ====="
+          tail -n 150 /tmp/daed-build.log || true
 
       - name: Collect packages
         run: |
           mkdir -p out
           find "${SDK_NAME}/bin/packages" -type f \
-            \( -name 'daed*-2.1.1*.apk' -o -name 'daed*-2.1.1*.ipk' \) \
+            \( -name 'daed-2.1.1*.apk' -o -name 'daed_2.1.1*.ipk' \) \
             -exec cp -v {} out/ \;
           ls -lh out
           test -n "$(ls -A out)"

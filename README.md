@@ -99,7 +99,7 @@ sudo apt install -y build-essential gcc g++ binutils patch bzip2 flex bison make
 
 ```sh
 apk update
-apk add daed daed-geoip daed-geosite
+apk add daed
 /etc/init.d/daed enable
 uci set daed.config.enabled='1'
 uci commit daed
@@ -147,7 +147,7 @@ ls -l llvm-bpf/.llvm-version
 # 不要用 install -a：它会把 perl/uboot 等无关包也装进来，
 # 这些包的全局 prereq 检查（rsync、python3-pyelftools）会让
 # make package/daed/compile 在真正开始前就失败。
-for p in bpf-headers ca-certificates golang golang1.26 golang-bootstrap v2ray-geodata; do
+for p in bpf-headers ca-certificates golang golang1.26 golang-bootstrap; do
 	./scripts/feeds install -f "$p"
 done
 ```
@@ -187,8 +187,6 @@ sed -i \
 
 cat >> .config <<'EOF'
 CONFIG_PACKAGE_daed=y
-CONFIG_PACKAGE_daed-geoip=y
-CONFIG_PACKAGE_daed-geosite=y
 CONFIG_PACKAGE_kmod-sched-core=y
 CONFIG_PACKAGE_kmod-sched-bpf=y
 CONFIG_PACKAGE_kmod-xdp-sockets-diag=y
@@ -210,7 +208,6 @@ test -x llvm-bpf/bin/clang
 
 ```bash
 make -j$(nproc) package/daed/compile V=s
-make -j$(nproc) package/daed-geoip/compile package/daed-geosite/compile V=s
 ```
 
 第一次还会顺带编译 host 端的 Go 1.26 和 `bpf-headers`，再编 daed，大约 20–40 分钟。
@@ -225,15 +222,13 @@ make -j$(nproc) package/daed/compile V=s
 ### 5.6 找到产物
 
 ```bash
-find bin/packages \( -name 'daed-2.1.1*' -o -name 'daed-geo*-2.1.1*' \)
+find bin/packages -name 'daed-2.1.1*'
 ```
 
 通常会得到：
 
 ```
 bin/packages/aarch64_cortex-a53/base/daed-2.1.1-r1.apk
-bin/packages/aarch64_cortex-a53/base/daed-geoip-2.1.1-r1.apk
-bin/packages/aarch64_cortex-a53/base/daed-geosite-2.1.1-r1.apk
 ```
 
 （如果 SDK 被配置成 opkg，则是 `.ipk`，文件名类似
@@ -252,7 +247,7 @@ apk add kmod-sched-core kmod-sched-bpf kmod-xdp-sockets-diag kmod-veth
 
 ```sh
 cp -a /etc/daed /tmp/daed.bak 2>/dev/null
-apk del daed daed-geoip daed-geosite 2>/dev/null
+apk del daed 2>/dev/null
 ```
 
 上传并安装：
@@ -261,12 +256,6 @@ apk del daed daed-geoip daed-geosite 2>/dev/null
 scp daed-2.1.1-r1.apk root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 apk add --allow-untrusted /tmp/daed-2.1.1-r1.apk
-```
-
-如果还要 geo 数据：
-
-```sh
-apk add --allow-untrusted /tmp/daed-geoip-2.1.1-r1.apk /tmp/daed-geosite-2.1.1-r1.apk
 ```
 
 ### 5.8 启动
@@ -427,7 +416,8 @@ wget -qO- http://127.0.0.1:2023/ | head -c 200
 | `go: command not found` / 找不到 bpf-headers | 先跑 `make package/golang/host/compile` 和 `make package/bpf-headers/compile`，再编 daed |
 | `cp: cannot stat '.../.go_work/build/src/github.com/daeuniverse/dae-wing'` | 跳过了 Go 的拷贝式 configure，但 `Build/InstallDev` 默认仍去拷源码。Makefile 里已用空的 `Build/InstallDev` 关掉 |
 | `u-boot: Please install the Python3 elftools module` | 装 `python3-pyelftools`，或 `pip3 install --break-system-packages pyelftools` |
-| `package/feeds/packages/perl failed to build`（卡在 prereq） | 不要 `feeds install -a`，按 5.2 只装 `bpf-headers ca-certificates golang golang1.26 golang-bootstrap v2ray-geodata`；perl/uboot 的全局 prereq 就不会被触发 |
+| `package/feeds/packages/perl failed to build`（卡在 prereq） | 不要 `feeds install -a`，按 5.2 只装 `bpf-headers ca-certificates golang golang1.26 golang-bootstrap`；perl/uboot 的全局 prereq 就不会被触发 |
+| `No rule to make target 'package/daed-geoip/compile'` | 三个二进制包都来自 `package/daed/`，只有 `package/daed/compile`；geo 包已从 Makefile 移除，只编主包 |
 | `ERROR: package 'bpf-headers' is not available` | 没执行 `./scripts/feeds update -a && ./scripts/feeds install -a`；SDK 的 base feed 提供 bpf-headers |
 | `clang: not found` / `LLVM/clang version too old` | 没解压 `llvm-bpf-21.1.6...tar.zst`，或没选 `CONFIG_BPF_TOOLCHAIN_PREBUILT=y` |
 | `pattern web: no matching files found` | web.zip 没解压成功/缓存损坏。删 `build_dir/target-*/daed-2.1.1` 和 `dl/daed-web-2.1.1.zip` 重来 |

@@ -82,20 +82,6 @@ define Package/daed
     +kmod-veth
 endef
 
-define Package/daed-geoip
-  $(call Package/daed/Default)
-  TITLE:=geoip for daed
-  DEPENDS:=+daed +v2ray-geoip
-  PKGARCH:=all
-endef
-
-define Package/daed-geosite
-  $(call Package/daed/Default)
-  TITLE:=geosite for daed
-  DEPENDS:=+daed +v2ray-geosite
-  PKGARCH:=all
-endef
-
 define Package/daed/description
   daed is a backend of dae, provides a method to bundle arbitrary
   frontend, dae and geodata into one binary.
@@ -217,17 +203,5 @@ define Package/daed/install
 	$(INSTALL_BIN) $(CURDIR)/files/daed.init $(1)/etc/init.d/daed
 endef
 
-define Package/daed-geoip/install
-	$(INSTALL_DIR) $(1)/usr/share/daed
-	$(LN) ../v2ray/geoip.dat $(1)/usr/share/daed/geoip.dat
-endef
-
-define Package/daed-geosite/install
-	$(INSTALL_DIR) $(1)/usr/share/daed
-	$(LN) ../v2ray/geosite.dat $(1)/usr/share/daed/geosite.dat
-endef
-
 $(eval $(call Download,daed-web))
 $(eval $(call BuildPackage,daed))
-$(eval $(call BuildPackage,daed-geoip))
-$(eval $(call BuildPackage,daed-geosite))
