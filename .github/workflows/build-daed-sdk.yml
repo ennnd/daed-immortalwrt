@@ -78,6 +78,14 @@ jobs:
           cd "${SDK_NAME}"
           sh "${GITHUB_WORKSPACE}/scripts/install-package.sh" "$PWD"
 
+      - name: Patch SDK config
+        run: |
+          cd "${SDK_NAME}"
+          python3 "${GITHUB_WORKSPACE}/scripts/patch-sdk-config.py" Config-build.in
+          echo "---- llvm-bpf ----"
+          ls -ld llvm-bpf
+          cat llvm-bpf/.llvm-version
+
       - name: Configure
         run: |
           cd "${SDK_NAME}"
@@ -92,13 +100,9 @@ jobs:
             -e 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' \
             -e 's/^CONFIG_ALL_NONSHARED=y/# CONFIG_ALL_NONSHARED is not set/' \
             -e 's/^CONFIG_TARGET_ALL_PROFILES=y/# CONFIG_TARGET_ALL_PROFILES is not set/' \
-            -e 's/^CONFIG_BPF_TOOLCHAIN_NONE=y/# CONFIG_BPF_TOOLCHAIN_NONE is not set/' \
-            -e 's/^CONFIG_BPF_TOOLCHAIN_BUILD_LLVM=y/# CONFIG_BPF_TOOLCHAIN_BUILD_LLVM is not set/' \
-            -e 's/^CONFIG_BPF_TOOLCHAIN_HOST=y/# CONFIG_BPF_TOOLCHAIN_HOST is not set/' \
             .config
 
           {
-            echo 'CONFIG_BPF_TOOLCHAIN_PREBUILT=y'
             echo 'CONFIG_PACKAGE_daed=y'
             echo 'CONFIG_PACKAGE_daed-geoip=y'
             echo 'CONFIG_PACKAGE_daed-geosite=y'
@@ -110,12 +114,21 @@ jobs:
 
           make defconfig
           echo "---- check ----"
-          grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed|PACKAGE_kmod-sched|PACKAGE_kmod-veth|PACKAGE_kmod-xdp)' .config
+          grep -E 'CONFIG_(USE_LLVM|HAS_BPF|NEED_BPF|PACKAGE_daed|PACKAGE_kmod-sched|PACKAGE_kmod-veth|PACKAGE_kmod-xdp)' .config
           echo "---- ALL_* should be off ----"
           grep -E '^CONFIG_(ALL|ALL_KMODS|ALL_NONSHARED|BUILDBOT)' .config || true
 
           grep -q '^CONFIG_PACKAGE_daed=y' .config || { echo "ERROR: daed 没有被选中"; exit 1; }
-          grep -q '^CONFIG_BPF_TOOLCHAIN_PREBUILT=y' .config || { echo "ERROR: BPF 工具链不是 prebuilt"; exit 1; }
+          grep -q '^CONFIG_USE_LLVM_PREBUILT=y' .config || {
+            echo "ERROR: 没有选中预编译 LLVM"
+            grep -n -A3 'USE_LLVM' Config-build.in || true
+            exit 1
+          }
+          if grep -q '^CONFIG_USE_LLVM_BUILD=y' .config; then
+            echo "ERROR: USE_LLVM_BUILD 仍为 y，会从源码编译 LLVM"
+            exit 1
+          fi
+          test -x llvm-bpf/bin/clang || { echo "ERROR: llvm-bpf/bin/clang 不存在"; ls -la llvm-bpf; exit 1; }
 
       - name: Build daed
         run: |

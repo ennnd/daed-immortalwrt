@@ -169,24 +169,23 @@ sh /home/you/daed-immortalwrt/scripts/install-package.sh "$PWD"
 ### 5.4 配置 BPF 工具链和要编的包
 
 ```bash
+# 关键：SDK 的 Config-build.in 会把 BPF 工具链强制成 BUILD_LLVM，
+# 而 Kconfig 对无 prompt 的符号会忽略 .config 里的值。
+# 先打补丁，改成使用预编译的 llvm-bpf。
+python3 /home/you/daed-immortalwrt/scripts/patch-sdk-config.py Config-build.in
+
 make defconfig
 
-# SDK 默认可能带 CONFIG_ALL_*（全选 uboot/perl 等无关包），
-# 会让 make package/daed/compile 先对一堆无关包做 host 依赖检查。
-# 关掉它们，同时选“预编译 LLVM 工具链”。
+# 关掉可能残留的“全选”项
 sed -i \
   -e 's/^CONFIG_BUILDBOT=y/# CONFIG_BUILDBOT is not set/' \
   -e 's/^CONFIG_ALL=y/# CONFIG_ALL is not set/' \
   -e 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' \
   -e 's/^CONFIG_ALL_NONSHARED=y/# CONFIG_ALL_NONSHARED is not set/' \
   -e 's/^CONFIG_TARGET_ALL_PROFILES=y/# CONFIG_TARGET_ALL_PROFILES is not set/' \
-  -e 's/^CONFIG_BPF_TOOLCHAIN_NONE=y/# CONFIG_BPF_TOOLCHAIN_NONE is not set/' \
-  -e 's/^CONFIG_BPF_TOOLCHAIN_BUILD_LLVM=y/# CONFIG_BPF_TOOLCHAIN_BUILD_LLVM is not set/' \
-  -e 's/^CONFIG_BPF_TOOLCHAIN_HOST=y/# CONFIG_BPF_TOOLCHAIN_HOST is not set/' \
   .config
 
 cat >> .config <<'EOF'
-CONFIG_BPF_TOOLCHAIN_PREBUILT=y
 CONFIG_PACKAGE_daed=y
 CONFIG_PACKAGE_daed-geoip=y
 CONFIG_PACKAGE_daed-geosite=y
@@ -198,14 +197,14 @@ EOF
 
 make defconfig
 
-# 检查结果：必须有 PREBUILT=y 和 PACKAGE_daed=y
-grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed|PACKAGE_kmod-sched|PACKAGE_kmod-veth|PACKAGE_kmod-xdp)' .config
-# ALL_* 应该都是 not set
-grep -E '^CONFIG_(ALL|ALL_KMODS|ALL_NONSHARED|BUILDBOT)' .config || true
+# 检查：应该看到 USE_LLVM_PREBUILT=y，且没有 USE_LLVM_BUILD=y
+grep -E 'CONFIG_(USE_LLVM|HAS_BPF|NEED_BPF|PACKAGE_daed|PACKAGE_kmod-sched|PACKAGE_kmod-veth|PACKAGE_kmod-xdp)' .config
+grep -q '^CONFIG_USE_LLVM_BUILD=y' .config && { echo "ERROR: 会从源码编 LLVM"; exit 1; }
+test -x llvm-bpf/bin/clang
 ```
 
-如果 `CONFIG_BPF_TOOLCHAIN_PREBUILT` 没生效，可以在 `make menuconfig` 里按 `/` 搜索
-`BPF_TOOLCHAIN_PREBUILT` 手动选中（看不到选项时先打开 `CONFIG_DEVEL`）。
+如果打补丁后还是 `USE_LLVM_BUILD=y`，说明 `llvm-bpf` 没解压到 SDK 根目录，检查
+`llvm-bpf/.llvm-version` 和 `llvm-bpf/bin/clang` 是否存在。
 
 ### 5.5 编译
 
