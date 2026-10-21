@@ -1,0 +1,114 @@
+name: build-daed-sdk
+
+# 用 ImmortalWrt 25.12.2 SDK 编译 daed 2.1.1（只编包，不编固件）。
+# 触发方式:
+#   1) Actions 页面手动 Run workflow
+#   2) 推送 v* 标签（会额外把 apk 传到 Release）
+#
+# 产物: 本次 run 页面底部的 Artifacts -> daed-2.1.1-apk
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  ILW_RELEASE: "25.12.2"
+  TARGET_DIR: "rockchip/armv8"
+  SDK_NAME: "immortalwrt-sdk-25.12.2-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64"
+  LLVM_BPF: "llvm-bpf-21.1.6.Linux-x86_64.tar.zst"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show disk before
+        run: df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ binutils patch bzip2 flex bison make \
+            autoconf gettext texinfo unzip sharutils libncurses-dev zlib1g-dev \
+            gawk git rsync python3 python3-setuptools wget curl zstd bc libssl-dev
+
+      - name: Download SDK and llvm-bpf
+        run: |
+          set -euo pipefail
+          BASE="https://downloads.immortalwrt.org/releases/${ILW_RELEASE}/targets/${TARGET_DIR}"
+          curl -fL --retry 5 --retry-delay 5 -o sdk.tar.zst "${BASE}/${SDK_NAME}.tar.zst"
+          curl -fL --retry 5 --retry-delay 5 -o llvm-bpf.tar.zst "${BASE}/${LLVM_BPF}"
+          tar --zstd -xf sdk.tar.zst
+          tar --zstd -xf llvm-bpf.tar.zst -C "${SDK_NAME}"
+          test -f "${SDK_NAME}/llvm-bpf/.llvm-version"
+
+      - name: Update feeds
+        run: |
+          cd "${SDK_NAME}"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Install daed package
+        run: |
+          cd "${SDK_NAME}"
+          sh "${GITHUB_WORKSPACE}/scripts/install-package.sh" "$PWD"
+
+      - name: Configure
+        run: |
+          cd "${SDK_NAME}"
+          make defconfig
+          sed -i \
+            -e 's/^CONFIG_BPF_TOOLCHAIN_NONE=y/# CONFIG_BPF_TOOLCHAIN_NONE is not set/' \
+            -e 's/^CONFIG_BPF_TOOLCHAIN_BUILD_LLVM=y/# CONFIG_BPF_TOOLCHAIN_BUILD_LLVM is not set/' \
+            -e 's/^CONFIG_BPF_TOOLCHAIN_HOST=y/# CONFIG_BPF_TOOLCHAIN_HOST is not set/' \
+            .config
+          {
+            echo 'CONFIG_BPF_TOOLCHAIN_PREBUILT=y'
+            echo 'CONFIG_PACKAGE_daed=y'
+            echo 'CONFIG_PACKAGE_daed-geoip=y'
+            echo 'CONFIG_PACKAGE_daed-geosite=y'
+          } >> .config
+          make defconfig
+          grep -E 'CONFIG_(BPF_TOOLCHAIN|PACKAGE_daed)' .config
+
+      - name: Build daed
+        run: |
+          cd "${SDK_NAME}"
+          make -j"$(nproc)" package/daed/compile V=s
+
+      - name: Collect packages
+        run: |
+          mkdir -p out
+          find "${SDK_NAME}/bin/packages" -type f \
+            \( -name 'daed*-2.1.1*.apk' -o -name 'daed*-2.1.1*.ipk' \) \
+            -exec cp -v {} out/ \;
+          ls -lh out
+          test -n "$(ls -A out)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-2.1.1-apk
+          path: out/*
+          if-no-files-found: error
+
+      - name: Attach to Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "daed 2.1.1 for ImmortalWrt 25.12.2 (rockchip/armv8, NanoPi R2S)"
+          gh release upload "$GITHUB_REF_NAME" out/* --clobber

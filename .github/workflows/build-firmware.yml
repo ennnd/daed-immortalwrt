@@ -1,0 +1,106 @@
+name: build-firmware
+
+# 全量编译 ImmortalWrt 25.12.2 + daed 2.1.1，产出 NanoPi R2S 固件。
+#
+# 注意:
+#   - GitHub 托管 runner 只有约 14 GB 空闲磁盘，必须先清理（下面已做）；
+#   - 4 vCPU 全量编译约 3–5 小时，job 上限 6 小时；
+#   - 如果仍然磁盘不足/超时，建议改用更大的 runner，或只跑 build-daed-sdk.yml。
+
+on:
+  workflow_dispatch:
+
+env:
+  ILW_RELEASE: "25.12.2"
+  TARGET_DIR: "rockchip/armv8"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          docker image prune -af || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ binutils patch bzip2 flex bison make \
+            autoconf gettext texinfo unzip sharutils libncurses-dev zlib1g-dev \
+            gawk git rsync python3 python3-setuptools wget curl zstd bc libssl-dev
+
+      - name: Clone ImmortalWrt
+        run: |
+          git clone --depth 1 -b openwrt-25.12 https://github.com/immortalwrt/immortalwrt.git
+          cd immortalwrt
+          git log -1 --oneline
+
+      - name: Download llvm-bpf
+        run: |
+          set -euo pipefail
+          BASE="https://downloads.immortalwrt.org/releases/${ILW_RELEASE}/targets/${TARGET_DIR}"
+          curl -fL --retry 5 --retry-delay 5 -o llvm-bpf.tar.zst \
+            "${BASE}/llvm-bpf-21.1.6.Linux-x86_64.tar.zst"
+          tar --zstd -xf llvm-bpf.tar.zst -C immortalwrt
+          test -f immortalwrt/llvm-bpf/.llvm-version
+
+      - name: Update feeds
+        run: |
+          cd immortalwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Install daed package
+        run: |
+          cd immortalwrt
+          sh "${GITHUB_WORKSPACE}/scripts/install-package.sh" "$PWD"
+
+      - name: Configure
+        run: |
+          cd immortalwrt
+          make defconfig
+          cat "${GITHUB_WORKSPACE}/configs/nanopi-r2s.config" >> .config
+          make defconfig
+          echo "---- check ----"
+          grep -E 'CONFIG_KERNEL_(DEBUG_INFO_BTF|BPF_EVENTS|XDP_SOCKETS)|CONFIG_PACKAGE_daed|CONFIG_BPF_TOOLCHAIN' .config
+
+      - name: Download sources
+        run: |
+          cd immortalwrt
+          make -j"$(nproc)" download
+
+      - name: Build firmware
+        run: |
+          cd immortalwrt
+          # 不要加 V=s：全量编译的输出会非常大，失败时再单独用 V=s 重跑
+          make -j"$(nproc)"
+
+      - name: Collect images
+        run: |
+          mkdir -p out
+          find immortalwrt/bin/targets/rockchip/armv8 -maxdepth 1 -type f \
+            \( -name '*nanopi-r2s*squashfs-sysupgrade.img.gz' \
+               -o -name '*nanopi-r2s-ext4-sysupgrade.img.gz' \
+               -o -name 'sha256sums' \) \
+            -exec cp -v {} out/ \;
+          ls -lh out
+          test -n "$(ls -A out)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-nanopi-r2s-daed
+          path: out/*
+          if-no-files-found: error
