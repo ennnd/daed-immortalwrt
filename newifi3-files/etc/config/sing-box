@@ -1,0 +1,2 @@
+config sing-box 'main'
+	option enabled '1'
