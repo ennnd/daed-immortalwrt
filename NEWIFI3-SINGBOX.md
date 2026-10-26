@@ -223,6 +223,7 @@ echo 'nameserver 223.5.5.5' > /etc/resolv.conf
 | 现象 | 处理 |
 |---|---|
 | `v25.12.2` tag 不存在 | workflow 会自动回退到 `openwrt-25.12` 分支 |
+| `dependency on 'libcronet' ... syntax error` | master 的 1.14.3 包带了 `libcronet` 条件依赖，25.12.2 feed 没有这个包；workflow 已自动删掉这两行依赖 |
 | `sing-box` 编译报 Go 版本 | 25.12.2 的 feed 需要 Go 1.26；确认 `feeds update -a` 成功 |
 | linkname 相关错误 | 必须用 master 的 Makefile，不能只改 1.12.25 的版本号 |
 | 磁盘不足 | workflow 已删除 dotnet/android/ghc；仍不足就减少 feeds 或换 larger runner |

@@ -63,6 +63,15 @@ jobs:
             https://github.com/immortalwrt/packages.git /tmp/imm-packages
           rm -rf openwrt/package/sing-box openwrt/feeds/packages/net/sing-box
           cp -a /tmp/imm-packages/net/sing-box openwrt/package/sing-box
+
+          # 25.12.2 的 feed 没有 libcronet；mips 上 naive outbound 本来也不可用。
+          # 不删掉这个条件依赖，make defconfig 会因为不存在的包报 Kconfig 语法错误。
+          sed -i \
+            -e 's/ +SING_BOX_BUILD_NAIVE_OUTBOUND:libcronet//g' \
+            -e 's/ +SING_BOX_TINY_BUILD_NAIVE_OUTBOUND:libcronet//g' \
+            openwrt/package/sing-box/Makefile
+
+          grep -n 'libcronet' openwrt/package/sing-box/Makefile || true
           grep -E '^PKG_VERSION|^PKG_HASH' openwrt/package/sing-box/Makefile
 
       - name: Install firmware files
@@ -95,11 +104,16 @@ jobs:
           cd openwrt
           make defconfig
 
-          grep -q '^CONFIG_PACKAGE_sing-box-tiny=y' .config
           if grep -q '^CONFIG_PACKAGE_sing-box=y' .config; then
             sed -i 's/^CONFIG_PACKAGE_sing-box=y/# CONFIG_PACKAGE_sing-box is not set/' .config
             echo 'CONFIG_PACKAGE_sing-box-tiny=y' >> .config
             make defconfig
+          fi
+
+          if ! grep -q '^CONFIG_PACKAGE_sing-box-tiny=y' .config; then
+            echo "ERROR: sing-box-tiny is not selected" >&2
+            grep -E 'CONFIG_PACKAGE_sing-box' .config || true
+            exit 1
           fi
 
           grep -E 'CONFIG_TARGET_DEVICE_ramips_mt7621_DEVICE_d-team_newifi-d2|CONFIG_PACKAGE_sing-box' .config
