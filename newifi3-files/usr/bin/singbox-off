@@ -1,0 +1,15 @@
+#!/bin/sh
+# 关闭 sing-box，并把 dnsmasq 的 DNS 恢复监听 53
+set -e
+
+/etc/init.d/sing-box stop 2>/dev/null || true
+/etc/init.d/sing-box disable 2>/dev/null || true
+
+uci set sing-box.main.enabled='0'
+uci commit sing-box
+
+uci set dhcp.@dnsmasq[0].port='53'
+uci commit dhcp
+/etc/init.d/dnsmasq restart
+
+echo "sing-box stopped; dnsmasq DNS restored on port 53"

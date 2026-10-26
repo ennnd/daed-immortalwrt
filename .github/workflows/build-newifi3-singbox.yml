@@ -79,13 +79,13 @@ jobs:
             https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs \
             -o openwrt/files/etc/sing-box/rule-set/geoip-cn.srs
 
-          chmod +x openwrt/files/etc/uci-defaults/99-singbox-dns
+          chmod +x openwrt/files/usr/bin/singbox-on openwrt/files/usr/bin/singbox-off
           ls -l openwrt/files/etc/sing-box/rule-set/
 
       - name: Check node placeholders
         run: |
           if grep -q "YOUR_" newifi3-files/etc/sing-box/config.json; then
-            echo "::warning::config.json still contains YOUR_* placeholders; the firmware will build, but sing-box will not connect until you fill in real nodes."
+            echo "::notice::config.json contains placeholders; sing-box is disabled by default. Fill nodes on the router and run singbox-on."
           fi
 
       - name: Configure

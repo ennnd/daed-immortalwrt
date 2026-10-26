@@ -1,8 +1,0 @@
-#!/bin/sh
-# dnsmasq 只做 DHCP；LAN 客户端 DNS 指向 223.5.5.5，由 sing-box TUN 接管
-uci set dhcp.@dnsmasq[0].port='0'
-uci -q delete dhcp.lan.dhcp_option
-uci add_list dhcp.lan.dhcp_option='6,223.5.5.5'
-uci commit dhcp
-/etc/init.d/dnsmasq restart
-exit 0

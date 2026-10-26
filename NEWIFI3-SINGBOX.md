@@ -1,6 +1,8 @@
 # Newifi3（Newifi D2）+ ImmortalWrt 25.12.2 + sing-box-tiny 1.14.3
 
-用 GitHub Actions 直接编译 Newifi3 固件，内置：
+用 GitHub Actions 编译 Newifi3 固件，**固件本身不含任何节点信息**；刷机后在路由器上手动填节点并启用。
+
+内置：
 
 - ImmortalWrt 25.12.2（`ramips/mt7621`，`d-team_newifi-d2`）
 - `sing-box-tiny` **1.14.3**（来自 ImmortalWrt master 的包定义）
@@ -11,6 +13,8 @@
 
 镜像预计 **20–21 MiB**，剩余 overlay 约 **10–11 MiB**。
 
+> 固件里的 `sing-box` 默认**不启动**（`enabled '0'`），dnsmasq 也保持正常 DNS。刷完机先正常上网，再填节点、执行 `singbox-on`。
+
 ---
 
 ## 目录
@@ -19,77 +23,17 @@
 .github/workflows/build-newifi3-singbox.yml   # GitHub Actions
 configs/newifi3-singbox.config                 # 固件 .config
 newifi3-files/
-└── etc/
-    ├── config/sing-box                        # 开机启用
-    ├── sing-box/config.json                   # 节点 + DNS + 分流
-    └── uci-defaults/99-singbox-dns            # dnsmasq 只做 DHCP
+├── etc/
+│   ├── config/sing-box                        # 默认 enabled '0'
+│   └── sing-box/config.json                   # 模板（YOUR_* 占位）
+└── usr/bin/
+    ├── singbox-on                             # 填好节点后启用
+    └── singbox-off                            # 关闭并恢复 dnsmasq DNS
 ```
 
 ---
 
-## 1. 修改节点
-
-编辑 `newifi3-files/etc/sing-box/config.json` 里的 `outbounds`。
-
-### VLESS + Reality 节点
-
-```json
-{
-  "type": "vless",
-  "tag": "node1",
-  "server": "1.2.3.4",
-  "server_port": 443,
-  "uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "flow": "xtls-rprx-vision",
-  "tls": {
-    "enabled": true,
-    "server_name": "portal.example.com",
-    "utls": { "enabled": true, "fingerprint": "chrome" },
-    "reality": {
-      "enabled": true,
-      "public_key": "xxxxxxxx",
-      "short_id": "xxxxxxxx"
-    }
-  }
-}
-```
-
-### Shadowsocks 节点
-
-```json
-{
-  "type": "shadowsocks",
-  "tag": "node2",
-  "server": "5.6.7.8",
-  "server_port": 8388,
-  "method": "aes-256-gcm",
-  "password": "xxxxxxxx"
-}
-```
-
-改完后：
-
-1. 把 `YOUR_SERVER`、`YOUR_UUID`、`YOUR_SNI`、`YOUR_REALITY_PUBLIC_KEY`、`YOUR_REALITY_SHORT_ID`、`YOUR_PASSWORD` 全部替换成真实值；
-2. 如果增删节点，同步修改 `urltest` 的 `outbounds` 列表：
-
-```json
-{
-  "type": "urltest",
-  "tag": "auto",
-  "outbounds": ["node1", "node2", "node3"],
-  "url": "https://www.gstatic.com/generate_204",
-  "interval": "10m",
-  "tolerance": 50
-}
-```
-
-`proxy` 选择器会自动使用 `auto`（测速选最快）。
-
-> **不要把带真实节点的 config.json 推到公开仓库**。节点里有 UUID/密码，公开等于泄露。建议用私有仓库，或在推送前替换成占位值。
-
----
-
-## 2. 触发编译
+## 1. 触发编译
 
 这些文件已经放在本仓库根目录：
 
@@ -109,9 +53,11 @@ immortalwrt-25.12.2-ramips-mt7621-d-team_newifi-d2-squashfs-sysupgrade.bin
 
 也可以推 `newifi3-*` 标签触发。
 
+配置里的 `YOUR_*` 占位符**不影响编译**；workflow 只会打印一条 notice。
+
 ---
 
-## 3. 刷机
+## 2. 刷机
 
 1. 断电，按住 Reset，通电，保持 5–8 秒，浏览器打开 `192.168.1.1` 进入 Breed。
 2. **先备份** full flash 和 EEPROM/factory（5G 校准数据）。
@@ -122,47 +68,135 @@ immortalwrt-25.12.2-ramips-mt7621-d-team_newifi-d2-squashfs-sysupgrade.bin
 
 ---
 
-## 4. 刷完后的检查
+## 3. 刷完后：在路由器上填节点
+
+固件默认：
+
+- `sing-box` 不启动；
+- dnsmasq 正常监听 53，LAN 可以正常上网。
+
+### 3.1 编辑配置
+
+SSH 登录路由器：
 
 ```sh
-# 服务状态
+ssh root@192.168.1.1
+vi /etc/sing-box/config.json
+```
+
+或者从电脑上传（推荐，JSON 不容易改错）：
+
+```powershell
+scp .\config.json root@192.168.1.1:/etc/sing-box/config.json
+```
+
+把 `outbounds` 里的 `YOUR_*` 换成真实值：
+
+| 占位符 | 含义 |
+|---|---|
+| `YOUR_SERVER` | 节点地址（IP 或域名） |
+| `YOUR_UUID` | VLESS UUID |
+| `YOUR_SNI` | Reality 的 SNI |
+| `YOUR_REALITY_PUBLIC_KEY` | Reality 公钥 `pbk` |
+| `YOUR_REALITY_SHORT_ID` | Reality `sid` |
+| `YOUR_PASSWORD` | Shadowsocks 密码 |
+
+如果增删节点，同步修改 `urltest` 的 `outbounds`：
+
+```json
+{
+  "type": "urltest",
+  "tag": "auto",
+  "outbounds": ["node1", "node2", "node3"],
+  "url": "https://www.gstatic.com/generate_204",
+  "interval": "10m",
+  "tolerance": 50
+}
+```
+
+### 3.2 先校验
+
+```sh
+sing-box check -c /etc/sing-box/config.json
+```
+
+没有输出就是通过。
+
+### 3.3 启用
+
+```sh
+singbox-on
+```
+
+它会：
+
+1. 检查配置里是否还有 `YOUR_`；
+2. `sing-box check`；
+3. 启动 sing-box，确认进程在跑；
+4. 成功后才把 dnsmasq 改成只做 DHCP，LAN DNS 指向 `223.5.5.5`；
+5. 打印状态和最近日志。
+
+如果 sing-box 启动失败，它**不会**改 dnsmasq，避免整个 LAN 断网。
+
+### 3.4 关闭 / 回退
+
+```sh
+singbox-off
+```
+
+停止 sing-box，并把 dnsmasq 的 DNS 恢复监听 53。
+
+---
+
+## 4. 验证
+
+```sh
+# 服务
 /etc/init.d/sing-box status
 logread -e sing-box | tail -n 50
-
-# 配置语法（改过节点后建议先跑）
-sing-box check -c /etc/sing-box/config.json
 
 # 磁盘 / 内存
 df -h
 free -m
+```
 
-# DNS（LAN 客户端上）
+LAN 客户端上：
+
+```sh
 nslookup www.baidu.com
 nslookup www.google.com
 
-# 分流
 curl -I https://www.baidu.com
 curl -I https://www.google.com
 ```
 
-如果 `sing-box check` 报错，先看节点字段是否还有 `YOUR_`，以及 `urltest` 的 tag 是否对得上。
+预期：
+
+- `baidu.com` 直连、解析走 `223.5.5.5`；
+- `google.com` 走代理、解析走 DoH；
+- `singbox-off` 后一切恢复直连。
 
 ---
 
 ## 5. 说明与注意
 
-### dnsmasq 只做 DHCP
+### 为什么默认不启动
 
-`99-singbox-dns` 会执行：
+固件里没有节点，直接启动会失败；而且 `dnsmasq port=0` 会让 LAN 没有 DNS。所以默认：
+
+- `sing-box` disabled；
+- dnsmasq 正常；
+- 你填好节点、确认无误后再执行 `singbox-on`。
+
+### dnsmasq 的副作用
+
+`singbox-on` 成功后，dnsmasq 不再监听 53。**路由器本身**不能再用 dnsmasq 解析域名（`apk update` 可能受影响）。需要时：
 
 ```sh
-uci set dhcp.@dnsmasq[0].port='0'
-uci add_list dhcp.lan.dhcp_option='6,223.5.5.5'
+echo 'nameserver 223.5.5.5' > /etc/resolv.conf
 ```
 
-即 dnsmasq 不再监听 53，LAN 客户端直接查 `223.5.5.5`，由 TUN 接管后按 sing-box 的 DNS 规则分流。
-
-副作用：**路由器本身不能再用 dnsmasq 解析域名**（`apk update` 等可能受影响）。需要时临时改 `/etc/resolv.conf` 或把 `port` 改回 53。
+或者临时 `singbox-off`。
 
 ### 1.14 配置语法
 
@@ -170,19 +204,7 @@ uci add_list dhcp.lan.dhcp_option='6,223.5.5.5'
 - `cache_file` 用 `store_dns`，不是 `store_rdrc`；
 - `block` outbound 已弃用，本配置没有用它；
 - **1.14 必须提供 `route.default_domain_resolver`**，否则启动会报
-  `missing route.default_domain_resolver ...`；本配置已加：
-
-```json
-"default_domain_resolver": {
-  "server": "dns_cn"
-}
-```
-
-配置可以用 1.14.3 的 sing-box 二进制先校验（把 `YOUR_...` 换成真值后）：
-
-```sh
-sing-box check -c newifi3-files/etc/sing-box/config.json
-```
+  `missing route.default_domain_resolver ...`；本配置已加 `{ "server": "dns_cn" }`。
 
 ### 体积
 
