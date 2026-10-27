@@ -161,6 +161,16 @@ jobs:
           make -j"$(nproc)" download
           make -j"$(nproc)" V=s
 
+      # 先上传再检查：万一大小门限没过，固件也不会跟着一起丢掉（省一次 75 分钟重编）
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-newifi3-singbox
+          path: |
+            openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2*sysupgrade.bin
+            openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2*.manifest
+          if-no-files-found: error
+
       - name: Check image size
         run: |
           set -e
@@ -177,12 +187,3 @@ jobs:
           SIZE=$(stat -c%s "$BIN")
           echo "image size: $SIZE bytes (limit 33226752 = d-team_newifi-d2 IMAGE_SIZE 32448k)"
           test "$SIZE" -lt 33226752
-
-      - name: Upload firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: immortalwrt-newifi3-singbox
-          path: |
-            openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2*sysupgrade.bin
-            openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2*.manifest
-          if-no-files-found: error
