@@ -1,17 +1,29 @@
 {
+  // ====================================================================
+  // sing-box 1.14.x 配置模板
+  //   Newifi3 (Newifi D2) / ImmortalWrt 25.12.2 / sing-box-tiny 1.14.3
+  //
+  // 出厂带 YOUR_* 占位符，sing-box 默认不启动；填好节点后执行 singbox-on。
+  // 改完先自检：sing-box check -c /etc/sing-box/config.json
+  // 本文件支持 // 注释（sing-box 的 JSON 解析器允许注释）。
+  // ====================================================================
   "log": {
     "level": "warn",
     "timestamp": true
   },
   "dns": {
+    // 1.14：legacy DNS server 写法（address/tag 老格式）已在 1.12 弃用、1.14 移除，
+    // 必须用 type + server。
     "servers": [
       {
+        // 国内：UDP 直连，延迟最低
         "tag": "dns_cn",
         "type": "udp",
         "server": "223.5.5.5",
         "detour": "direct"
       },
       {
+        // 国外：DoH 走代理，避免 DNS 污染
         "tag": "dns_proxy",
         "type": "https",
         "server": "1.1.1.1",
@@ -33,7 +45,12 @@
       }
     ],
     "final": "dns_proxy",
-    "strategy": "ipv4_only"
+    "strategy": "ipv4_only",
+    // 1.14 新增：单次查询超时，默认 10s。路由器上 5s 足够。
+    "timeout": "5s",
+    // 1.14 新增：乐观缓存。缓存过期时先返回旧记录、后台刷新，
+    // 节点抖动或上游 DNS 慢时体感明显；不想要删掉这一行即可。
+    "optimistic": true
   },
   "inbounds": [
     {
@@ -42,9 +59,14 @@
       "address": [
         "172.19.0.1/30"
       ],
+      // mips 上的 sing-box-tiny 默认不编 gvisor（只在 arm/x86 默认开），
+      // 所以栈必须用 system。（1.15 会弃用 stack，到时删掉这行即可）
+      "stack": "system",
+      // 显式给 1500，避免默认 9000 在 PPPoE(1492) 线路上出现 PMTU 黑洞；
+      // 如果 WAN 是 PPPoE 且仍偶发卡顿，可以降到 1492。
+      "mtu": 1500,
       "auto_route": true,
-      "strict_route": false,
-      "stack": "system"
+      "strict_route": false
     }
   ],
   "outbounds": [
@@ -69,6 +91,7 @@
       "tolerance": 50
     },
     {
+      // 节点 1：VLESS + Reality（推荐）
       "type": "vless",
       "tag": "node1",
       "server": "YOUR_SERVER",
@@ -90,6 +113,7 @@
       }
     },
     {
+      // 节点 2：Shadowsocks（AEAD）
       "type": "shadowsocks",
       "tag": "node2",
       "server": "YOUR_SERVER",
@@ -98,6 +122,8 @@
       "password": "YOUR_PASSWORD"
     },
     {
+      // 节点 3：同节点 1，可换成另一台机器；不用就整段删掉，
+      // 并把上面 urltest 的 outbounds 里的 "node3" 一并删掉。
       "type": "vless",
       "tag": "node3",
       "server": "YOUR_SERVER",
@@ -126,7 +152,17 @@
   "route": {
     "rules": [
       {
-        "action": "sniff"
+        // 1.13 起 inbound 里的 sniff 字段已移除，嗅探只能写成 route 规则动作。
+        // 四类显式列出：缺 dns 就拿不到 protocol=dns，下面 hijack-dns 失效；
+        // 缺 quic 则 HTTP/3 流量嗅不到域名，会一路掉到 final 走代理。
+        "action": "sniff",
+        "sniffer": [
+          "dns",
+          "http",
+          "tls",
+          "quic"
+        ],
+        "timeout": "300ms"
       },
       {
         "protocol": "dns",
@@ -160,6 +196,8 @@
       }
     ],
     "final": "proxy",
+    // 1.14 起凡是需要解析域名的场景都必须显式指定解析器，否则启动直接报
+    // missing route.default_domain_resolver。
     "default_domain_resolver": {
       "server": "dns_cn"
     },
@@ -168,6 +206,8 @@
   "experimental": {
     "cache_file": {
       "enabled": true,
+      // 1.14：DNS 缓存落盘用 store_dns（store_rdrc 已弃用，1.16 移除）。
+      // 放在 /tmp 是有意的：tmpfs，重启即失效，不写 flash、不磨损 NAND。
       "path": "/tmp/sing-box-cache.db",
       "store_dns": true
     }

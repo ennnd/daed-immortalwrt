@@ -198,13 +198,41 @@ echo 'nameserver 223.5.5.5' > /etc/resolv.conf
 
 或者临时 `singbox-off`。
 
-### 1.14 配置语法
+### 1.14 配置写法与模板改动
 
-- DNS 服务器用 `type` + `server`，不是旧的 `address`；
-- `cache_file` 用 `store_dns`，不是 `store_rdrc`；
-- `block` outbound 已弃用，本配置没有用它；
-- **1.14 必须提供 `route.default_domain_resolver`**，否则启动会报
-  `missing route.default_domain_resolver ...`；本配置已加 `{ "server": "dns_cn" }`。
+模板已按 1.14 校准，用官方 1.14.3 二进制实测 `sing-box check` **通过且零告警**。
+
+#### 1.14 下已经被移除、不能再用的写法
+
+这才是"老配置起不来"的真正原因（本模板一条都没用）：
+
+| 旧写法 | 状态 | 现在怎么写 |
+|---|---|---|
+| `route.rules[].geoip` / `geosite` 字段 | 1.8 弃用、**1.12 移除**（1.14 直接报错） | `rule_set` + `geoip-cn.srs` / `geosite-cn.srs` |
+| DNS 服务器 `{"address": "..."}` 老格式 | 1.12 弃用、**1.14 移除** | `{"type": "udp/https/...", "server": "..."}` |
+| `inbounds[].sniff` / `domain_strategy` | 1.11 弃用、**1.13 移除** | `route.rules` 里的 `{"action": "sniff"}` |
+| `block` / `dns` 特殊 outbound | 1.11 弃用、**1.13 移除** | rule action（`reject` / `hijack-dns`） |
+| 缺 `route.default_domain_resolver` | 1.12 弃用、1.14 起拒绝启动 | `"default_domain_resolver": {"server": "dns_cn"}` |
+| `cache_file.store_rdrc` | 1.14 弃用、1.16 移除 | `cache_file.store_dns` |
+
+> 网上有文章说 1.14 移除了 FakeIP，**这是错的**：1.14.3 仍接受 `"type": "fakeip"`，官方弃用清单里也没有它。本模板不用 FakeIP 只是因为路由器上不需要。
+
+#### 这一版模板相对上一版的实际改动
+
+| # | 改动 | 原因 |
+|---|---|---|
+| 1 | `dns.timeout: "5s"` | 1.14 新增字段，默认 10s；路由器上没必要等这么久 |
+| 2 | `dns.optimistic: true` | 1.14 新增的乐观缓存：过期先回旧记录、后台刷新，弱网/节点抖动时体感明显（不想要删掉这行） |
+| 3 | 嗅探规则改成 `{"action":"sniff","sniffer":["dns","http","tls","quic"],"timeout":"300ms"}` | 原来只有 `{"action":"sniff"}`。显式列全四类：漏 `dns` 会让 `protocol: dns` 匹配不到、`hijack-dns` 失效；漏 `quic` 则 HTTP/3 嗅不到域名，一律掉到 `final` 走代理 |
+| 4 | `inbounds[0].mtu: 1500` | 默认 9000，PPPoE(1492) 线路上容易出 PMTU 黑洞；PPPoE 仍偶发卡顿可降到 1492 |
+| 5 | 全文件加 `//` 注释 | sing-box 的 JSON 解析器允许注释；模板是人来改的，注释比翻文档快。`singbox-on` 的 `YOUR_` 检查不受影响 |
+| 6 | 其余部分（DNS 服务器格式、`rule_set`、`hijack-dns`、`default_domain_resolver`、`store_dns`、`stack: system`） | **未改** —— 上一版已经是 1.14 写法，`check` 无告警 |
+
+改完或升级节点后，先在路由器上自检：
+
+```sh
+sing-box check -c /etc/sing-box/config.json
+```
 
 ### 体积
 
@@ -223,7 +251,8 @@ echo 'nameserver 223.5.5.5' > /etc/resolv.conf
 | 现象 | 处理 |
 |---|---|
 | `v25.12.2` tag 不存在 | workflow 会自动回退到 `openwrt-25.12` 分支 |
-| `dependency on 'libcronet' ... syntax error` | master 的 1.14.3 包带了 `libcronet` 条件依赖，25.12.2 feed 没有这个包；workflow 已自动删掉这两行依赖 |
+| `dependency on 'libcronet' ...` 只是 warning | 25.12.2 feed 没有 `libcronet`，但**不会**导致 Kconfig 语法错误；workflow 删掉这两行只是为了少点噪音 |
+| `tmp/.config-package.in: syntax error` / `invalid statement` | 真凶是把 master 的包 `cp` 到 `openwrt/package/sing-box`：包内 `include ../../lang/golang/golang-package.mk` 只在 feed 三级深度成立，路径失效后 `GO_ARCH_DEPENDS` 为空，config 块首行变成空的 `depends on`。workflow 已改为覆盖 `feeds/packages/net/sing-box` |
 | `sing-box` 编译报 Go 版本 | 25.12.2 的 feed 需要 Go 1.26；确认 `feeds update -a` 成功 |
 | linkname 相关错误 | 必须用 master 的 Makefile，不能只改 1.12.25 的版本号 |
 | 磁盘不足 | workflow 已删除 dotnet/android/ghc；仍不足就减少 feeds 或换 larger runner |
@@ -235,4 +264,4 @@ echo 'nameserver 223.5.5.5' > /etc/resolv.conf
 - sing-box：1.14.3（ImmortalWrt master 的包定义，PKG_HASH 已固定）
 - 规则集：SagerNet `rule-set` 分支，编译时下载
 
-以后要升 1.14.4：把 `openwrt/package/sing-box/Makefile` 里的 `PKG_VERSION` 改成 `1.14.4`，重新算 `PKG_HASH` 即可，配置不用再迁移（同属 1.14）。
+以后要升 1.14.4：把 `openwrt/feeds/packages/net/sing-box/Makefile` 里的 `PKG_VERSION` 改成 `1.14.4`，重新算 `PKG_HASH` 即可，配置不用再迁移（同属 1.14）。

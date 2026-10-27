@@ -11,7 +11,9 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 固定 24.04：ubuntu-latest 正在迁移到 Ubuntu 26，迁移后 apt 包名/工具链都可能变，
+    # 冒这个风险不值得。
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
@@ -50,29 +52,54 @@ jobs:
           cd openwrt
           git log -1 --oneline
 
+      # 先只 update，不 install：install 会按 feeds 里的内容生成 package/feeds/* 软链接，
+      # 必须在下面换掉 sing-box 之后再做，链接才会指向 1.14.3。
       - name: Update feeds
         run: |
           cd openwrt
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
 
       - name: Add sing-box 1.14.3 package
         run: |
           set -e
           git clone --depth 1 -b master \
             https://github.com/immortalwrt/packages.git /tmp/imm-packages
-          rm -rf openwrt/package/sing-box openwrt/feeds/packages/net/sing-box
-          cp -a /tmp/imm-packages/net/sing-box openwrt/package/sing-box
+
+          # 必须放回 feed 的原始层级（feeds/packages/net/sing-box）。
+          # 该 Makefile 用 `include ../../lang/golang/golang-package.mk` 引入 golang 宏，
+          # 这个相对路径只有“三级深度”才成立；放到 package/sing-box 会指向不存在的
+          # <topdir>/lang/golang/golang-package.mk，于是 GO_ARCH_DEPENDS 未定义，
+          # config 块首行 `depends on $(subst @,,$(GO_ARCH_DEPENDS))` 展开成空的
+          # `depends on`，make defconfig 时 Kconfig 直接报 syntax error。
+          rm -rf openwrt/package/sing-box
+          rm -rf openwrt/feeds/packages/net/sing-box
+          cp -a /tmp/imm-packages/net/sing-box openwrt/feeds/packages/net/sing-box
 
           # 25.12.2 的 feed 没有 libcronet；mips 上 naive outbound 本来也不可用。
-          # 不删掉这个条件依赖，make defconfig 会因为不存在的包报 Kconfig 语法错误。
+          # 保留这个条件依赖只会产生 select PACKAGE_libcronet 的 warning，
+          # 顺手去掉少点噪音。
           sed -i \
             -e 's/ +SING_BOX_BUILD_NAIVE_OUTBOUND:libcronet//g' \
             -e 's/ +SING_BOX_TINY_BUILD_NAIVE_OUTBOUND:libcronet//g' \
-            openwrt/package/sing-box/Makefile
+            openwrt/feeds/packages/net/sing-box/Makefile
 
-          grep -n 'libcronet' openwrt/package/sing-box/Makefile || true
-          grep -E '^PKG_VERSION|^PKG_HASH' openwrt/package/sing-box/Makefile
+          # 自检 1：Makefile 里的相对 include 必须能落到 feed 的 golang 目录
+          test -f openwrt/feeds/packages/net/sing-box/../../lang/golang/golang-package.mk
+          # 自检 2：GO_ARCH_DEPENDS 必须真的存在（它是 config 块首行的依赖表达式）
+          grep -q '^GO_ARCH_DEPENDS:=@(' \
+            openwrt/feeds/packages/lang/golang/golang-values.mk
+          grep -n 'libcronet' openwrt/feeds/packages/net/sing-box/Makefile || true
+          grep -E '^PKG_VERSION|^PKG_HASH' openwrt/feeds/packages/net/sing-box/Makefile
+
+      - name: Install feeds
+        run: |
+          set -e
+          cd openwrt
+          ./scripts/feeds install -a
+          # feeds install 生成的链接形如
+          #   package/feeds/packages/sing-box -> ../../../feeds/packages/net/sing-box
+          ls -l package/feeds/packages/ | grep -i 'sing-box'
+          grep -E '^PKG_VERSION' package/feeds/packages/sing-box/Makefile
 
       - name: Install firmware files
         run: |
