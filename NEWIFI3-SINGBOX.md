@@ -256,6 +256,7 @@ sing-box check -c /etc/sing-box/config.json
 | `sing-box` 编译报 Go 版本 | 25.12.2 的 feed 需要 Go 1.26；确认 `feeds update -a` 成功 |
 | linkname 相关错误 | 必须用 master 的 Makefile，不能只改 1.12.25 的版本号 |
 | 磁盘不足 | workflow 已删除 dotnet/android/ghc；仍不足就减少 feeds 或换 larger runner |
+| 编译跑完但 `Check image size` 报 `cannot access ...*-sysupgrade.bin` | 目标设备没被选中：`make defconfig` 静默丢弃了设备符号，回退到子目标默认设备（`ramips/mt7621` 是 **ADSLR G7**），它的 `IMAGE_SIZE` 只有 16 MB，装不下 ~20 MB 的镜像，于是谁的 sysupgrade 都没生成。单设备必须写 `CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y`；`CONFIG_TARGET_DEVICE_...`（多一个 `DEVICE_`）属于 `CONFIG_TARGET_MULTI_PROFILE=y` 才可见的符号 |
 | 镜像超限 | 去掉 LuCI，或改用官方 OpenWrt 基础镜像（7.50 MiB） |
 
 ### 版本

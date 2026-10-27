@@ -131,6 +131,16 @@ jobs:
           cd openwrt
           make defconfig
 
+          # 目标设备必须是 d-team_newifi-d2。符号写错（例如多设备专用的
+          # CONFIG_TARGET_DEVICE_<board>_<sub>_DEVICE_<dev>）时 defconfig 会静默丢弃，
+          # 回退到子目标默认设备（ramips/mt7621 是 ADSLR G7），白编译一小时才在
+          # "Check image size" 报没有 sysupgrade —— 所以这里先卡死。
+          if ! grep -q '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y' .config; then
+            echo "ERROR: target device d-team_newifi-d2 is not selected" >&2
+            grep -E '^CONFIG_TARGET_(ramips|MULTI_PROFILE|PROFILE)' .config || true
+            exit 1
+          fi
+
           if grep -q '^CONFIG_PACKAGE_sing-box=y' .config; then
             sed -i 's/^CONFIG_PACKAGE_sing-box=y/# CONFIG_PACKAGE_sing-box is not set/' .config
             echo 'CONFIG_PACKAGE_sing-box-tiny=y' >> .config
@@ -143,7 +153,7 @@ jobs:
             exit 1
           fi
 
-          grep -E 'CONFIG_TARGET_DEVICE_ramips_mt7621_DEVICE_d-team_newifi-d2|CONFIG_PACKAGE_sing-box' .config
+          grep -E '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y|^CONFIG_PACKAGE_sing-box' .config
 
       - name: Build
         run: |
@@ -154,15 +164,25 @@ jobs:
       - name: Check image size
         run: |
           set -e
-          BIN=$(ls openwrt/bin/targets/ramips/mt7621/*-sysupgrade.bin | head -n1)
+          OUT=openwrt/bin/targets/ramips/mt7621
+          BIN=$(ls "$OUT"/*d-team_newifi-d2-sysupgrade.bin 2>/dev/null | head -n1 || true)
+          if [ -z "$BIN" ]; then
+            echo "::error::no d-team_newifi-d2 sysupgrade image was produced"
+            echo "--- 目录内容 ---"
+            ls -lh "$OUT" 2>/dev/null || true
+            echo "--- 其他设备的镜像（说明选错了 profile）---"
+            ls "$OUT"/*-sysupgrade.bin 2>/dev/null || true
+            exit 1
+          fi
           ls -lh "$BIN"
           SIZE=$(stat -c%s "$BIN")
           echo "image size: $SIZE bytes"
+          # d-team_newifi-d2 的 IMAGE_SIZE 是 32448k
           test "$SIZE" -lt 33226752
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-newifi3-singbox
-          path: openwrt/bin/targets/ramips/mt7621/*-sysupgrade.bin
+          path: openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2-sysupgrade.bin
           if-no-files-found: error
