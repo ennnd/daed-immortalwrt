@@ -11,7 +11,7 @@
 - 流量分流：内网 / `geosite-cn` / `geoip-cn` 直连；其余走代理
 - TUN 模式，system 栈
 
-镜像预计 **20–21 MiB**，剩余 overlay 约 **10–11 MiB**。
+镜像实测 **19.0 MiB**（pad 后 19,922,944 字节，上限 31.7 MiB），剩余 overlay 约 **12 MiB**。
 
 > 固件里的 `sing-box` 默认**不启动**（`enabled '0'`），dnsmasq 也保持正常 DNS。刷完机先正常上网，再填节点、执行 `singbox-on`。
 
@@ -144,7 +144,7 @@ singbox-on
 singbox-off
 ```
 
-停止 sing-box，并把 dnsmasq 的 DNS 恢复监听 53。
+停止 sing-box，并把 dnsmasq 的 DNS 恢复监听 53，同时删掉 `singbox-on` 加的 DHCP DNS 选项，LAN 客户端重新用路由器做 DNS。
 
 ---
 
@@ -241,8 +241,8 @@ sing-box check -c /etc/sing-box/config.json
 | 基础镜像 | 9.88 MiB |
 | `sing-box-tiny` 1.14.3 | 12.27 MiB（apk） |
 | 规则集 | 87 KiB |
-| 预计镜像 | **20–21 MiB** |
-| 剩余 overlay | **10–11 MiB** |
+| 实测镜像 | **19.0 MiB**（pad 后 19,922,944 B） |
+| 剩余 overlay | 约 **12 MiB** |
 
 如果镜像超过 21 MiB，优先去掉 LuCI（`configs/newifi3-singbox.config` 里注释 `CONFIG_PACKAGE_luci=y`），可省 2–3 MiB。
 

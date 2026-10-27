@@ -165,24 +165,24 @@ jobs:
         run: |
           set -e
           OUT=openwrt/bin/targets/ramips/mt7621
-          BIN=$(ls "$OUT"/*d-team_newifi-d2-sysupgrade.bin 2>/dev/null | head -n1 || true)
+          # 实际文件名是 ...-d-team_newifi-d2-squashfs-sysupgrade.bin，
+          # 不要把 -squashfs- 写死在通配符里。
+          BIN=$(ls "$OUT"/*d-team_newifi-d2*sysupgrade.bin 2>/dev/null | head -n1 || true)
           if [ -z "$BIN" ]; then
             echo "::error::no d-team_newifi-d2 sysupgrade image was produced"
-            echo "--- 目录内容 ---"
             ls -lh "$OUT" 2>/dev/null || true
-            echo "--- 其他设备的镜像（说明选错了 profile）---"
-            ls "$OUT"/*-sysupgrade.bin 2>/dev/null || true
             exit 1
           fi
           ls -lh "$BIN"
           SIZE=$(stat -c%s "$BIN")
-          echo "image size: $SIZE bytes"
-          # d-team_newifi-d2 的 IMAGE_SIZE 是 32448k
+          echo "image size: $SIZE bytes (limit 33226752 = d-team_newifi-d2 IMAGE_SIZE 32448k)"
           test "$SIZE" -lt 33226752
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-newifi3-singbox
-          path: openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2-sysupgrade.bin
+          path: |
+            openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2*sysupgrade.bin
+            openwrt/bin/targets/ramips/mt7621/*d-team_newifi-d2*.manifest
           if-no-files-found: error
