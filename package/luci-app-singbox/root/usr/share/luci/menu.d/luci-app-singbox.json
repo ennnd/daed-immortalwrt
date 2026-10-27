@@ -1,0 +1,48 @@
+{
+	"admin/services/sing-box": {
+		"title": "Sing-Box",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-singbox" ]
+		}
+	},
+
+	"admin/services/sing-box/overview": {
+		"title": "状态",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "singbox/overview"
+		}
+	},
+
+	"admin/services/sing-box/nodes": {
+		"title": "节点与订阅",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "singbox/nodes"
+		}
+	},
+
+	"admin/services/sing-box/routing": {
+		"title": "分流与 DNS",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "singbox/routing"
+		}
+	},
+
+	"admin/services/sing-box/advanced": {
+		"title": "高级",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "singbox/advanced"
+		}
+	}
+}

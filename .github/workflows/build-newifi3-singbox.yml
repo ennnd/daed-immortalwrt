@@ -101,6 +101,50 @@ jobs:
           ls -l package/feeds/packages/ | grep -i 'sing-box'
           grep -E '^PKG_VERSION' package/feeds/packages/sing-box/Makefile
 
+      # LuCI 面板。必须在 Configure 之前放进 package/，否则 defconfig 扫不到这个包。
+      # 该包用 `include $(TOPDIR)/feeds/luci/luci.mk`（luci.mk 在 feed 根目录），
+      # 所以依赖 feeds install 之后才存在；顺序不能动。
+      - name: Install luci-app-singbox
+        run: |
+          set -e
+          rm -rf openwrt/package/luci-app-singbox
+          cp -a package/luci-app-singbox openwrt/package/
+          test -f openwrt/package/luci-app-singbox/Makefile
+          test -f openwrt/feeds/luci/luci.mk
+
+          # 前端语法（LuCI view 是 AMD 模块，node 只查语法）
+          find package/luci-app-singbox/htdocs -name '*.js' | while read f; do
+            node --check "$f"
+          done
+
+          # 纯逻辑单测：JSONC 剥注释 / base64 / URI 解析 / 订阅三格式 / 合并与 members 修正
+          node package/luci-app-singbox/test/run.js
+
+      # 把解析出的节点合并进真实配置模板，用官方 1.14.3 二进制验 schema。
+      # 这一步能在编译前挡住"字段写错、1.14 不认"的问题，省一次 75 分钟。
+      - name: Validate sample config with sing-box 1.14.3
+        run: |
+          set -e
+          curl -fsSL -o /tmp/sb.tgz \
+            https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz
+          tar -xzf /tmp/sb.tgz -C /tmp
+          mkdir -p /tmp/rs
+          curl -fsSL -o /tmp/rs/geosite-cn.srs \
+            https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs
+          curl -fsSL -o /tmp/rs/geoip-cn.srs \
+            https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs
+          SINGBOX_SAMPLE=/tmp/sample.json node package/luci-app-singbox/test/run.js
+          sed -i 's#/etc/sing-box/rule-set/#/tmp/rs/#g' /tmp/sample.json
+          /tmp/sing-box-1.14.3-linux-amd64/sing-box check -c /tmp/sample.json
+          echo "sample config OK"
+
+          # 再跑一遍"模拟 LuCI"测试：四个页面 render + 节点/订阅写入链路，
+          # 最后把它真实写出的 config.json 也过一遍 check。
+          SIM_OUT=/tmp/app-written.json node package/luci-app-singbox/test/sim.js
+          sed -i 's#/etc/sing-box/rule-set/#/tmp/rs/#g' /tmp/app-written.json
+          /tmp/sing-box-1.14.3-linux-amd64/sing-box check -c /tmp/app-written.json
+          echo "UI written config OK"
+
       - name: Install firmware files
         run: |
           set -e
@@ -120,7 +164,7 @@ jobs:
 
       - name: Check node placeholders
         run: |
-          if grep -q "YOUR_" newifi3-files/etc/sing-box/config.json; then
+          if grep -q '"YOUR_' newifi3-files/etc/sing-box/config.json; then
             echo "::notice::config.json contains placeholders; sing-box is disabled by default. Fill nodes on the router and run singbox-on."
           fi
 
@@ -153,13 +197,40 @@ jobs:
             exit 1
           fi
 
-          grep -E '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y|^CONFIG_PACKAGE_sing-box' .config
+          # 同理：luci-app-singbox 的符号如果不可见，defconfig 也会静默丢弃，
+          # 编出来就是一个没有面板的固件，白等一小时。
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-singbox=y' .config; then
+            echo "ERROR: luci-app-singbox is not selected" >&2
+            grep -E 'CONFIG_PACKAGE_(luci|luci-lib|luci-app)' .config | head -20 || true
+            exit 1
+          fi
+
+          grep -E '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y|^CONFIG_PACKAGE_sing-box|^CONFIG_PACKAGE_luci-app-singbox|^CONFIG_LUCI_LANG' .config
 
       - name: Build
         run: |
           cd openwrt
           make -j"$(nproc)" download
           make -j"$(nproc)" V=s
+
+      # 编译完先确认面板真的装进了镜像：包编出来但没进 rootfs 的情况，
+      # 只有刷机后才会发现（manifest 是唯一便宜的现场证据）。
+      - name: Verify luci-app-singbox in image
+        run: |
+          set -e
+          M=$(ls openwrt/bin/targets/ramips/mt7621/*.manifest 2>/dev/null | head -n1 || true)
+          if [ -z "$M" ]; then
+            echo "::error::没有生成 manifest"
+            exit 1
+          fi
+          grep -iE 'sing-box|luci-app-singbox|uclient-fetch|ca-bundle' "$M" || true
+          if ! grep -q 'luci-app-singbox' "$M"; then
+            echo "::error::luci-app-singbox 没有进镜像"
+            exit 1
+          fi
+          if ! grep -q 'luci-i18n-singbox' "$M"; then
+            echo "::warning::中文语言包没进镜像（面板仍可用，因为源码里的 msgid 就是中文）"
+          fi
 
       # 先上传再检查：万一大小门限没过，固件也不会跟着一起丢掉（省一次 75 分钟重编）
       - name: Upload firmware

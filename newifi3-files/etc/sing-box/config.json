@@ -3,7 +3,9 @@
   // sing-box 1.14.x 配置模板
   //   Newifi3 (Newifi D2) / ImmortalWrt 25.12.2 / sing-box-tiny 1.14.3
   //
-  // 出厂带 YOUR_* 占位符，sing-box 默认不启动；填好节点后执行 singbox-on。
+  // 出厂带占位符（server / uuid / 密钥等几处），sing-box 默认不启动；
+  // 填好节点后执行 singbox-on，或在 LuCI「服务 → Sing-Box」里点启用。
+  // 判断"是否还有占位符"只匹配带引号的字段值，不匹配注释，所以注释随便写。
   // 改完先自检：sing-box check -c /etc/sing-box/config.json
   // 本文件支持 // 注释（sing-box 的 JSON 解析器允许注释）。
   // ====================================================================

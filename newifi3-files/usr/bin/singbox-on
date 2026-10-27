@@ -7,7 +7,7 @@ set -e
 
 CFG=/etc/sing-box/config.json
 
-if grep -q 'YOUR_' "$CFG"; then
+if grep -q '"YOUR_' "$CFG"; then
 	echo "ERROR: $CFG still contains YOUR_* placeholders" >&2
 	echo "Edit it first (vi or scp), then run this script again." >&2
 	exit 1

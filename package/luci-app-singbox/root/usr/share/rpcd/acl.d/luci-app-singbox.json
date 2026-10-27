@@ -1,0 +1,55 @@
+{
+	"luci-app-singbox": {
+		"description": "Grant access to sing-box configuration",
+		"read": {
+			"file": {
+				"/etc/sing-box/config.json": [ "read" ],
+				"/etc/sing-box/config.default.json": [ "read" ],
+				"/etc/sing-box/subscriptions.json": [ "read" ],
+				"/etc/sing-box/backup": [ "list" ],
+				"/etc/sing-box/backup/*": [ "read" ],
+				"/etc/sing-box/rule-set/*": [ "list" ],
+				"/rom/etc/sing-box/config.json": [ "read" ],
+				"/tmp/luci-singbox-sub.txt": [ "read" ]
+			},
+			"uci": [ "sing-box", "dhcp" ]
+		},
+		"write": {
+			"file": {
+				"/etc/sing-box/config.json": [ "write" ],
+				"/etc/sing-box/config.json.tmp": [ "write" ],
+				"/etc/sing-box/subscriptions.json": [ "write" ],
+				"/etc/sing-box/backup/*": [ "write" ],
+				"/etc/sing-box/rule-set/*": [ "write" ],
+
+				"/usr/bin/sing-box": [ "exec" ],
+				"/etc/init.d/sing-box": [ "exec" ],
+				"/etc/init.d/dnsmasq": [ "exec" ],
+				"/bin/mv": [ "exec" ],
+				"/bin/mkdir": [ "exec" ],
+
+				"/bin/pidof": [ "exec" ],
+				"/sbin/pidof": [ "exec" ],
+				"/usr/bin/pidof": [ "exec" ],
+
+				"/sbin/logread": [ "exec" ],
+				"/bin/logread": [ "exec" ],
+				"/usr/bin/logread": [ "exec" ],
+
+				"/sbin/uci": [ "exec" ],
+				"/bin/uci": [ "exec" ],
+				"/usr/bin/uci": [ "exec" ],
+
+				"/bin/uclient-fetch": [ "exec" ],
+				"/usr/bin/uclient-fetch": [ "exec" ],
+
+				"/sbin/ip": [ "exec" ],
+				"/bin/ip": [ "exec" ],
+				"/usr/bin/ip": [ "exec" ],
+
+				"/tmp/luci-singbox-sub.txt": [ "write" ]
+			},
+			"uci": [ "sing-box", "dhcp" ]
+		}
+	}
+}

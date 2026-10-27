@@ -29,6 +29,7 @@ newifi3-files/
 └── usr/bin/
     ├── singbox-on                             # 填好节点后启用
     └── singbox-off                            # 关闭并恢复 dnsmasq DNS
+package/luci-app-singbox/                      # LuCI 面板（订阅/节点/分流/高级）
 ```
 
 ---
@@ -148,7 +149,60 @@ singbox-off
 
 ---
 
-## 4. 验证
+## 4. LuCI 面板（菜单：服务 → Sing-Box）
+
+刷完机后不用 SSH 也能全部搞定。四个页签：
+
+| 页签 | 能做什么 |
+|---|---|
+| **状态** | 服务状态 / PID / 版本 / TUN 接口 / dnsmasq 是否已被接管 / urltest 最近选中项；启用、停用、重启按钮；最近日志 |
+| **节点与订阅** | 节点表格（增删改，类型联动字段：vless / vmess / trojan / shadowsocks / hysteria2 / tuic）；订阅：粘贴 URL → 立即更新 → 预览（识别 N 个、跳过 M 个及原因）→ 写入 |
+| **分流与 DNS** | 三种分流模式（全局代理 / 大陆直连 / 全部直连）；rule-set（geosite-cn、geoip-cn）一键更新；DNS 服务器、strategy、optimistic、timeout |
+| **高级** | config.json 原始编辑器（带校验）、恢复出厂配置、备份列表与回滚 |
+
+### 4.1 订阅支持的格式
+
+| 输入 | 说明 |
+|---|---|
+| base64 包装的 URI 列表 | 机场最通用，UA 用 `v2rayN/6.0` 一般就是这个格式 |
+| 明文 URI 列表 | 每行一个 `vless://` / `vmess://` / `trojan://` / `ss://` / `hysteria2://` / `tuic://` |
+| sing-box 配置 JSON | 含 `outbounds` 的对象，直接取其中的代理出站 |
+
+**不支持 Clash YAML**（要在前端写 YAML 解析器不划算，检测到会提示改用 URI/JSON 格式）。
+
+订阅大小上限 **200KB**：LuCI 通过 rpcd 的 `file` 服务读文件，rpcd 的 `RPC_FILE_MAX_SIZE` 是 256KB，留了余量。200KB 大约够 300+ 个节点。
+
+### 4.2 写入流程（每次保存都一样）
+
+```
+备份 config.json → /etc/sing-box/backup/config-<时间戳>.json（只留最近 5 份）
+写 config.json.tmp
+sing-box check -c config.json.tmp   ← 失败则删 tmp、原文件不动、错误原文回显
+mv config.json.tmp config.json      ← 原子替换
+服务在运行的话 /etc/init.d/sing-box restart
+```
+
+合并规则：**同 tag 覆盖，新 tag 追加**；写完后自动修正 `selector` / `urltest` 的 members 与 default（指向不存在的 tag 会被删掉，default 失效就取第一个成员），修正动作会显示在提示里。
+
+### 4.3 恢复出厂
+
+出厂原件取自 **`/rom/etc/sing-box/config.json`**——这是 squashfs 只读层（overlayfs 的 lower），只有被写过才会 copy-up，所以它永远是出厂那份，不占 overlay 空间。恢复后配置回到带 `YOUR_*` 占位符的模板，需要重新填节点。
+
+### 4.4 已知限制
+
+- **没有实时面板**：没启用 `experimental.clash_api`，所以没有流量曲线、连接列表，也**没有节点延迟测试**。判断节点好坏只能看日志里 urltest 的选择结果。
+- **不支持 gRPC 传输的节点**：tiny 变体在 mips 上没有 `with_gvisor` / `with_grpc`，解析器会把 `net=grpc` 的节点跳过并计数（机场里这类节点占比不低，请留意预览页的"跳过原因"）。
+- 不支持 WireGuard / naive / OpenVPN / SSR / 带 plugin 的 SS。
+- TUN 只能 `stack: system`（没有 gvisor）。
+- **UI 保存会重写 config.json，注释会丢**（前端没有能保留注释的 JSON 库）；想保留注释就 SSH 手改，或用「高级」页的原始编辑器（保存时同样会丢，但至少能贴回来）。
+
+### 4.5 为什么没有 ucode/rpcd 后端
+
+面板是纯前端（AMD 模块）+ LuCI 自带的 `fs` / `uci` RPC，没有需要交叉编译的 C 代码或 ucode 脚本。这样做的直接好处：**解析逻辑可以用 node 在本机单测**（`test/run.js`，59 条断言覆盖 JSONC 剥注释、base64、7 种 URI 解析、订阅三格式、合并与 members 修正），CI 里还会拿官方 1.14.3 二进制对"真实模板 + 解析出的节点"跑一次 `sing-box check`。权限由 ACL 精确到具体路径与可执行文件。
+
+---
+
+## 5. 验证
 
 ```sh
 # 服务
@@ -178,7 +232,7 @@ curl -I https://www.google.com
 
 ---
 
-## 5. 说明与注意
+## 6. 说明与注意
 
 ### 为什么默认不启动
 
