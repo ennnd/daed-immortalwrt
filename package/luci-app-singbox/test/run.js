@@ -13,13 +13,55 @@ const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
 
-/* 按 LuCI 的方式加载模块：把源码包成 function(require, exports, module) 并取 return 值 */
+/*
+ * 按 LuCI 的方式加载模块：扫描文件头的 require 指令，把源码包成
+ * function(window, document, L<deps>) 执行，然后"把返回的 class new 出来"。
+ * 最后一步是关键——LuCI 的 require() 会 new 它再返回实例，
+ * 直接 return 普通对象会在浏览器里报 "factory yields invalid constructor"。
+ */
+function makeBaseClass() {
+	function Base() {}
+	Base.extend = function(props) {
+		function C() {}
+		C.prototype = Object.create(Base.prototype);
+		for (const k in props)
+			if (Object.prototype.hasOwnProperty.call(props, k))
+				C.prototype[k] = props[k];
+		return C;
+	};
+	return Base;
+}
+
+const BaseClass = makeBaseClass();
+
+function loadModule(relPath) {
+	const src = fs.readFileSync(path.join(ROOT, relPath), 'utf8');
+	const re = /^require[ \t]+(\S+)(?:[ \t]+as[ \t]+([A-Za-z_]\S*))?$/;
+	const deps = [], names = [];
+
+	src.split('\n').forEach(line => {
+		const m = re.exec(line.trim().replace(/^['"]|['"];?$/g, ''));
+		if (m) {
+			deps.push(m[1]);
+			names.push(m[2] || m[1].replace(/[^A-Za-z0-9_]/g, '_'));
+		}
+	});
+
+	const factory = new Function('window', 'document', 'L' + (names.length ? ', ' + names.join(', ') : ''), src);
+	const args = deps.map(d => {
+		if (d === 'baseclass') return BaseClass;
+		throw new Error(relPath + ' 依赖了 ' + d + '，单测里没有对应实现');
+	});
+	const ret = factory(null, null, null, ...args);
+
+	if (typeof ret !== 'function')
+		throw new Error(relPath + ' factory 没有返回 class（LuCI 会报 factory yields invalid constructor）');
+
+	return new ret();
+}
+
 function loadCore() {
-	const src = fs.readFileSync(path.join(ROOT, 'htdocs/luci-static/resources/singbox/core.js'), 'utf8');
-	const factory = new Function('require', 'exports', 'module', src);
-	const mod = { exports: {} };
-	const ret = factory(function() { throw new Error('core.js 不应 require 任何模块'); }, mod.exports, mod);
-	return ret || mod.exports;
+	return loadModule('htdocs/luci-static/resources/singbox/core.js');
 }
 
 const core = loadCore();
@@ -37,6 +79,8 @@ function eq(name, actual, expected) {
 	ok(name, JSON.stringify(actual) === JSON.stringify(expected),
 		'got ' + JSON.stringify(actual) + ' want ' + JSON.stringify(expected));
 }
+
+ok('core.js 导出的是 class（LuCI 的 require 会 new 它）', typeof core.parseJsonc === 'function');
 
 /* ---------- 1. JSONC ---------- */
 

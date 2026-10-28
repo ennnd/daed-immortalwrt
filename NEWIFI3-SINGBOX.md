@@ -198,7 +198,7 @@ mv config.json.tmp config.json      ← 原子替换
 
 ### 4.5 为什么没有 ucode/rpcd 后端
 
-面板是纯前端（AMD 模块）+ LuCI 自带的 `fs` / `uci` RPC，没有需要交叉编译的 C 代码或 ucode 脚本。这样做的直接好处：**解析逻辑可以用 node 在本机单测**（`test/run.js`，59 条断言覆盖 JSONC 剥注释、base64、7 种 URI 解析、订阅三格式、合并与 members 修正），CI 里还会拿官方 1.14.3 二进制对"真实模板 + 解析出的节点"跑一次 `sing-box check`。权限由 ACL 精确到具体路径与可执行文件。
+面板是纯前端（AMD 模块）+ LuCI 自带的 `fs` / `uci` RPC，没有需要交叉编译的 C 代码或 ucode 脚本。这样做的直接好处：**解析逻辑可以用 node 在本机单测**（`test/run.js`，60 条断言覆盖 JSONC 剥注释、base64、7 种 URI 解析、订阅三格式、合并与 members 修正），CI 里还会拿官方 1.14.3 二进制对"真实模板 + 解析出的节点"跑一次 `sing-box check`。权限由 ACL 精确到具体路径与可执行文件。
 
 ---
 

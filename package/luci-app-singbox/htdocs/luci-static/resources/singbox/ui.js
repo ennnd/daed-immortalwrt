@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 /* luci-app-singbox 的界面小工具（只依赖 LuCI 的 ui 与全局 E/_） */
 'require ui';
 'require singbox.core as core';
@@ -200,7 +201,7 @@ var modal = function(title, children) {
 	]);
 };
 
-return {
+return baseclass.extend({
 	fmtTime: fmtTime,
 	fmtBytes: fmtBytes,
 	notify: notify,
@@ -221,4 +222,4 @@ return {
 	warn: warn,
 	action: action,
 	modal: modal
-};
+});

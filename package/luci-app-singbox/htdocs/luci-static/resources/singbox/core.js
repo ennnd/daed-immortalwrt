@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 /*
  * luci-app-singbox 纯逻辑层
  *
@@ -1255,7 +1256,11 @@ function proxyNodes(cfg) {
 	return out;
 }
 
-return {
+/*
+ * 必须 return 一个 class：LuCI 的 require() 会 new 它再返回实例，
+ * 直接 return 普通对象会报 "factory yields invalid constructor"。
+ */
+return baseclass.extend({
 	trimStr: trimStr,
 	b64ToBytes: b64ToBytes,
 	utf8Decode: utf8Decode,
@@ -1285,4 +1290,4 @@ return {
 	removeOutbound: removeOutbound,
 	outboundSummary: outboundSummary,
 	proxyNodes: proxyNodes
-};
+});

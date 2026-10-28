@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 /*
  * luci-app-singbox 的 I/O 层
  *
@@ -470,4 +471,5 @@ api.updateRuleSet = function(tag) {
 		});
 };
 
-return api;
+/* 同 core：必须导出 class，LuCI 会 new 它 */
+return baseclass.extend(api);

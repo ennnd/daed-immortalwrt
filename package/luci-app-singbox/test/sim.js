@@ -166,9 +166,20 @@ function modulePath(name) {
 	return path.join(RES, name.replace(/\./g, '/') + '.js');
 }
 
+/* 模仿 LuCI 的 baseclass：extend() 返回一个真正的 class（不是普通对象），
+   require() 会 new 它再返回实例 */
+function makeClass(props) {
+	function C() {}
+	C.prototype = Object.create(null);
+	for (const k in props)
+		if (Object.prototype.hasOwnProperty.call(props, k))
+			C.prototype[k] = props[k];
+	return C;
+}
+
 const builtins = {
-	view: { extend: obj => obj },
-	baseclass: { extend: obj => obj },
+	view: { extend: props => makeClass(props) },
+	baseclass: { extend: props => makeClass(props) },
 	fs: fakeFs,
 	uci: fakeUci,
 	ui: fakeUi,
@@ -196,8 +207,15 @@ function load(name) {
 	const deps = names.map(load);
 	const factory = new Function('window', 'document', 'L' + (args.length ? ', ' + args.join(', ') : ''), src);
 	const out = factory(global.window, global.document, global.L, ...deps);
-	cache[name] = out;
-	return out;
+
+	/* 和 LuCI 一样严格：factory 必须返回 class，否则浏览器里就是
+	   TypeError: "xxx" factory yields invalid constructor */
+	if (typeof out !== 'function')
+		throw new Error(name + ' factory yields invalid constructor（必须 return baseclass.extend(...) / view.extend(...)）');
+
+	const instance = new out();
+	cache[name] = instance;
+	return instance;
 }
 
 /* ---------------- 跑起来 ---------------- */
