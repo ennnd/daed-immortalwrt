@@ -218,6 +218,31 @@ ok('delete 后 auto 里没有 node2',
 const del2 = core.removeOutbound(cfg3, 'direct');
 ok('direct 不允许删除', del2.removed === false);
 
+/* ---------- 4b. selector 信息抽取 + 切换 default（节点选择下拉框） ---------- */
+
+const selCfg = core.parseJsonc(realCfgText);
+const info = core.selectorInfo(selCfg, 'proxy');
+ok('找到 proxy selector', info != null);
+eq('proxy 候选含 auto/node1/2/3',
+	info.outbounds, [ 'auto', 'node1', 'node2', 'node3' ]);
+eq('默认是 auto', info.current, 'auto');
+
+/* 切到 node1：default 被改，且只动了 proxy，不影响 auto 的成员 */
+core.applySelectorDefault(selCfg, 'proxy', 'node1');
+eq('proxy.default 变 node1',
+	selCfg.outbounds.filter(o => o.tag === 'proxy')[0].default, 'node1');
+ok('auto 的成员没被改动',
+	selCfg.outbounds.filter(o => o.tag === 'auto')[0].outbounds.join(',') === 'node1,node2,node3');
+
+/* 不在成员里应抛错 */
+let threw = false;
+try { core.applySelectorDefault(selCfg, 'proxy', 'ghost'); } catch (e) { threw = true; }
+ok('切换到不存在的成员会抛错', threw);
+
+/* 没有 proxy 时返回 null（UI 据此隐藏控件） */
+const noProxy = { outbounds: [ { type: 'vless', tag: 'node1' } ] };
+eq('无 proxy selector → null', core.selectorInfo(noProxy, 'proxy'), null);
+
 /* tag 去重 */
 const dup = [
 	{ type: 'vless', tag: '同名' }, { type: 'vless', tag: '同名' }, { type: 'vless', tag: '' }

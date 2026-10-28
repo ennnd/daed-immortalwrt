@@ -475,6 +475,32 @@ api.disable = function() {
 		.then(function() { return { running: false }; });
 };
 
+/*
+ * 切换 proxy selector 的当前出口：把 default 改成 member（必须是该出站 outbounds
+ * 里的成员），保存并重载。因为没开 Clash API，selector 只能在启动时按 default
+ * 选一个、运行时不热切，所以这里改完走 saveConfig（= 备份→check→写入→若运行中
+ * 则 restart），生效需要一次重启。obTag 默认 "proxy"。
+ */
+api.selectOutbound = function(obTag, member) {
+	var self = api;
+
+	obTag = obTag || 'proxy';
+
+	if (!member)
+		return Promise.reject(new Error(_('请选择一个出口')));
+
+	return self.readConfig().then(function(cfgres) {
+		var cfg = cfgres.cfg;
+
+		if (!cfg)
+			throw new Error(cfgres.error || _('配置解析失败'));
+
+		core.applySelectorDefault(cfg, obTag, member);
+
+		return self.saveConfig(cfg, _('切换出口到 ') + member);
+	});
+};
+
 /* ---------------- 订阅 ---------------- */
 
 api.fetchSubscription = function(url, ua) {

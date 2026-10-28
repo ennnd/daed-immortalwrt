@@ -1275,6 +1275,61 @@ function proxyNodes(cfg) {
 	return out;
 }
 
+/*
+ * 找到「proxy」这个 selector/urltest 出站，并抽出下拉框需要的信息：
+ *   { tag, type, outbounds[成员列表], current(当前 default) }
+ * 没找到（比如用户把 proxy 删了）返回 null，UI 据此隐藏切换控件。
+ */
+function selectorInfo(cfg, tag) {
+	tag = tag || 'proxy';
+
+	if (!cfg || !Array.isArray(cfg.outbounds))
+		return null;
+
+	for (var i = 0; i < cfg.outbounds.length; i++) {
+		var o = cfg.outbounds[i];
+
+		if (o.tag === tag && (o.type === 'selector' || o.type === 'urltest'))
+			return {
+				tag: o.tag,
+				type: o.type,
+				outbounds: Array.isArray(o.outbounds) ? o.outbounds : [],
+				current: o.default || (o.outbounds && o.outbounds[0]) || ''
+			};
+	}
+
+	return null;
+}
+
+/*
+ * 把 selector/urltest 的 default 改成 member（纯函数，原地改 cfg）。
+ * 校验：cfg 合法、该出站是 selector/urltest、member 确在其 outbounds 列表内。
+ * 任一不满足就抛错，由 api 层转成用户能看懂的提示。
+ */
+function applySelectorDefault(cfg, tag, member) {
+	if (!cfg || !Array.isArray(cfg.outbounds))
+		throw new Error(_('配置缺少 outbounds'));
+
+	var ob = null;
+
+	for (var i = 0; i < cfg.outbounds.length; i++) {
+		if (cfg.outbounds[i].tag === tag) {
+			ob = cfg.outbounds[i];
+			break;
+		}
+	}
+
+	if (!ob || (ob.type !== 'selector' && ob.type !== 'urltest'))
+		throw new Error(_('找不到 selector/urltest 出站：') + tag);
+
+	if (!Array.isArray(ob.outbounds) || ob.outbounds.indexOf(member) < 0)
+		throw new Error(_('出口「') + tag + _('」不包含成员「') + member + '」');
+
+	ob.default = member;
+
+	return cfg;
+}
+
 /* ---------------- 字段校验与错误诊断 ---------------- */
 
 /*
@@ -1455,6 +1510,8 @@ return baseclass.extend({
 	removeOutbound: removeOutbound,
 	outboundSummary: outboundSummary,
 	proxyNodes: proxyNodes,
+	selectorInfo: selectorInfo,
+	applySelectorDefault: applySelectorDefault,
 	realityKeyOk: realityKeyOk,
 	shortIdOk: shortIdOk,
 	explainCheckError: explainCheckError,

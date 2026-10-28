@@ -38,12 +38,18 @@ return view.extend({
 		}
 
 		this.placeholders = core.scanPlaceholders(cfg);
+		this.cfg = cfg;
 		this.bodyNode = E('div', {});
 		this.logNode = E('pre', {
 			'style': 'white-space:pre-wrap;word-break:break-all;max-height:22em;overflow:auto;font-size:11px;margin:0'
 		});
 
 		this.redraw(data.st);
+
+		var selCard = this.buildSelector(cfg);
+
+		if (selCard)
+			this.bodyNode.appendChild(selCard);
 
 		return E('div', {}, [
 			E('h2', {}, _('Sing-Box')),
@@ -62,6 +68,55 @@ return view.extend({
 					}))
 				])
 			])
+		]);
+	},
+
+	/*
+	 * 节点选择卡片：列出 proxy selector 的候选出口（auto + 各节点），
+	 * 当前选中的是 default。切换会写入 default 并重启 sing-box 生效。
+	 * 没有 proxy selector 时返回 null（UI 不显示）。
+	 */
+	buildSelector: function(cfg) {
+		var self = this;
+		var info = core.selectorInfo(cfg, 'proxy');
+
+		if (!info || info.outbounds.length === 0)
+			return null;
+
+		var cur = info.current;
+
+		var opts = info.outbounds.map(function(m) {
+			return E('option', { value: m, selected: (m === cur) ? 'selected' : null },
+				m === 'auto' ? _('自动（延迟最低）') : m);
+		});
+
+		var sel = E('select', { 'class': 'cbi-input-select', 'style': 'max-width:14em' }, opts);
+
+		var applyBtn = sbui.btn(_('应用'), 'cbi-button-apply', sbui.action(function() {
+			var v = sel.value;
+
+			if (v === cur) {
+				sbui.notifyOk(_('当前已是该出口'));
+				return;
+			}
+
+			return api.selectOutbound('proxy', v).then(function() {
+				sbui.notifyOk(_('已切换出口到 ') + v);
+				return self.reload();
+			}).catch(function(e) {
+				sbui.notifyError(String((e && e.message) || e));
+				return self.reload();
+			});
+		}));
+
+		return sbui.card(_('节点选择（出口）'), [
+			sbui.kvRow(_('当前出口'), cur === 'auto' ? _('自动（延迟最低）') : cur),
+			E('div', { 'style': 'margin:.6em 0' }, [
+				E('label', { 'style': 'margin-right:.6em' }, _('选择节点：')),
+				sel
+			]),
+			E('div', {}, applyBtn),
+			sbui.hint(_('selector 未启用 Clash API，切换需重启 sing-box 才生效。选 “自动” 则按延迟在节点间择优。'))
 		]);
 	},
 

@@ -73,10 +73,17 @@
   ],
   "outbounds": [
     {
+      // proxy 是 route.final 指向的出口，也是 LuCI「节点选择」下拉框操作的对象。
+      // 默认 auto（urltest 自动选延迟最低的节点）；想手动锁某台机器就在 UI 里选，
+      // 或把下面 default 改成 "node1"/"node2"/"node3"。删掉某个节点时记得把
+      // 它从 outbounds 列表一并删掉（LuCI 的「删除演示节点」会自动处理）。
       "type": "selector",
       "tag": "proxy",
       "outbounds": [
-        "auto"
+        "auto",
+        "node1",
+        "node2",
+        "node3"
       ],
       "default": "auto"
     },
@@ -147,8 +154,15 @@
       }
     },
     {
+      // 1.14.3 要求被 DNS detour 引用的 direct 出站不能是"空"出站
+      //（DialerOptions 全为默认值时 IsEmpty()==true，detour.go 会报
+      // "detour to an empty direct outbound makes no sense"）。
+      // 给任意一个非默认的拨号选项即可解除，这里用 reuse_addr（无害的
+      // socket 选项，不影响路由）；切勿用 bind_interface，否则会把
+      // 内网/直连流量全绑死到某个网口。
       "type": "direct",
-      "tag": "direct"
+      "tag": "direct",
+      "reuse_addr": true
     }
   ],
   "route": {
@@ -203,6 +217,11 @@
     "default_domain_resolver": {
       "server": "dns_cn"
     },
+    // auto_detect_interface：TUN + auto_route 下必须的防环设置（直连按目的地址
+    // 选出口，不会绕回 TUN）。但它依赖默认路由已存在，开机竞态会触发
+    // "missing default interface" 并 NetworkPause 暂停网络；由
+    // /etc/hotplug.d/iface/99-singbox 在 wan ifup 时重启 sing-box 规避，
+    // 别删那个 hotplug 脚本。
     "auto_detect_interface": true
   },
   "experimental": {
