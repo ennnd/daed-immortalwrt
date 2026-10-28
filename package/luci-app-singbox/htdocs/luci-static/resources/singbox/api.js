@@ -376,12 +376,29 @@ api.status = function() {
 	});
 };
 
+/* 防御：/etc/config/sing-box 若漏写 conffile，sing-box.init 会拼成
+   `sing-box run -c ""`，启动直接报 "read config at : open : no such file"。
+   启用前先确认 conffile 已设置，缺失则补上并 commit（让旧固件也能在 UI 里自救）。 */
+api.ensureConffile = function() {
+	var self = api;
+
+	return self.uciGet('sing-box', 'main', 'conffile').then(function(cf) {
+		if (cf && core.trimStr(cf))
+			return null;
+
+		return self.uci([ 'set', 'sing-box.main.conffile=' + CFG ])
+			.then(function() { return self.uci([ 'commit', 'sing-box' ]); });
+	});
+};
+
 /* 启用：完全按 /usr/bin/singbox-on 的顺序，失败回滚，绝不先动 dnsmasq */
 api.enable = function() {
 	var self = api;
 	var cfgText = '';
 
-	return self.readConfig().then(function(cfgres) {
+	return self.ensureConffile().then(function() {
+		return self.readConfig();
+	}).then(function(cfgres) {
 		var ph = core.scanPlaceholders(cfgres.cfg);
 
 		if (ph.length)

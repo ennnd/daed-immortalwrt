@@ -207,7 +207,21 @@ sing-box 原始错误：FATAL[0000] initialize outbound[2]: invalid public_key
 | `initialize outbound[N]: decode short_id ...` | short_id 必须是偶数位十六进制（≤16 位） | 改 `sid`，留空也行 |
 | `initialize outbound[N]: missing tags` | 某个 `selector` / `urltest` 没有任何成员（通常是删光了节点） | 面板会自动补 `direct` 兜底；仍报错就先加节点 |
 | `duplicate outbound/endpoint tag: xxx` | tag 重名 | 改名 |
+| `read config at : open : no such file or directory`（日志里 `at ` 后路径为空） | `/etc/config/sing-box` 缺少 `option conffile`，init 脚本拼出 `sing-box run -c ""` | 见下方「启动失败：conffile 缺失」 |
 | 面板通知「配置里还有未填的占位符」 | 出厂模板的 3 个演示节点没填 | 节点页点「删除演示节点」，或逐个填好 |
+
+#### 启动失败：conffile 缺失（已修复）
+
+早期版本 `newifi3-files/etc/config/sing-box` 只写了 `option enabled '0'`，**漏了 `option conffile '/etc/sing-box/config.json'`**。feed 的 `sing-box.init` 是 `config_get conffile ...; sing-box run -c "$conffile"`，拿到空值就变成 `sing-box run -c ""`，日志里报 `read config at : open : no such file or directory`。
+
+- 新固件：配置文件已补上 `conffile`，开箱即用。
+- 旧固件（已刷的）不想重编：在路由器上执行
+  ```sh
+  uci set sing-box.main.conffile='/etc/sing-box/config.json'
+  uci commit sing-box
+  /etc/init.d/sing-box restart
+  ```
+- 或在 LuCI「服务 → Sing-Box → 状态」点「启用」，面板会在启动前自动补 conffile（防御逻辑 `api.ensureConffile`）。
 
 出厂模板带 3 个演示节点（node1 VLESS+Reality、node2 Shadowsocks、node3 VLESS），值全是 `YOUR_*` 占位符。**它们不填就是坏的**，而 `sing-box check` 只要遇到一个就整份拒绝。所以正常流程是：订阅导入（会自动清掉这些演示节点）→ 启用；手工加节点前也可以先点一次「删除演示节点」。
 

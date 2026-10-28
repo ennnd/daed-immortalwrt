@@ -1,2 +1,10 @@
 config sing-box 'main'
 	option enabled '0'
+	# 必须显式给出配置文件路径：sing-box.init 用 `conffile` 拼成
+	# `sing-box run -c "$conffile"`，漏掉这一行会变成 `sing-box run -c ""`，
+	# 启动直接报 "read config at : open : no such file or directory"。
+	option conffile '/etc/sing-box/config.json'
+	option user 'root'
+	option workdir '/usr/share/sing-box'
+	option log_stderr '1'
+	option log_stdout '0'

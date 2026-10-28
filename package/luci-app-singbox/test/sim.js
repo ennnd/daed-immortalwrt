@@ -118,8 +118,25 @@ const fakeFs = {
 			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
 		}
 
-		if (/uci$/.test(cmd))
+		if (/uci$/.test(cmd)) {
+			/* 简单模拟 uci set X=Y / commit，方便测 ensureConffile */
+			if (a[0] === 'set') {
+				const m = /^(.+?)\.(.+?)\.(.+?)=(.+)$/.exec(a[1] || '');
+
+				if (m) {
+					const pkg = m[1], sid = m[2], opt = m[3], val = m[4];
+
+					if (!uciData[pkg])
+						uciData[pkg] = {};
+					if (!uciData[pkg][sid])
+						uciData[pkg][sid] = {};
+
+					uciData[pkg][sid][opt] = val;
+				}
+			}
+
 			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+		}
 
 		if (/uclient-fetch$/.test(cmd)) {
 			const out = a[a.indexOf('-O') + 1];
@@ -281,6 +298,8 @@ function load(name) {
 		calls.some(c => c[0] === 'exec' && /uci$/.test(c[1]) && (c[2] || '') === 'set' && (c[3] || '').indexOf('dnsmasq[0].port=0') > 0));
 	check('enable 写了 dhcp_option',
 		calls.some(c => c[0] === 'exec' && (c[2] || '') === 'add_list'));
+	check('enable 前确保 conffile 已设置（救回缺 conffile 的固件）',
+		uciData['sing-box']['main']['conffile'] === '/etc/sing-box/config.json');
 
 	const dis = await api.disable();
 	check('disable 成功', dis.running === false);
