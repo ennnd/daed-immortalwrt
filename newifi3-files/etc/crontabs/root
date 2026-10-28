@@ -1,0 +1,2 @@
+# sing-box safety auto-stop: daily revert to direct internet so LAN is never stuck offline
+30 6 * * * /usr/bin/singbox-safestop

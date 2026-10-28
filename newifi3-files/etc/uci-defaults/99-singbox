@@ -28,4 +28,14 @@ if [ -z "$f" ]; then
   uci set firewall.$f.dest='singbox'
 fi
 uci commit firewall
+
+# 启用 cron，使 sing-box 每日定时停止（安全网）生效；并保底写入 crontab 条目
+if [ -x /etc/init.d/cron ]; then
+  grep -q 'singbox-safestop' /etc/crontabs/root 2>/dev/null || cat >> /etc/crontabs/root <<'CRON'
+
+# sing-box safety auto-stop: daily revert to direct internet so LAN is never stuck offline
+30 6 * * * /usr/bin/singbox-safestop
+CRON
+  /etc/init.d/cron enable 2>/dev/null
+fi
 exit 0

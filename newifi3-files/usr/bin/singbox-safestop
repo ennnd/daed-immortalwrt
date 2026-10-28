@@ -1,0 +1,17 @@
+#!/bin/sh
+# sing-box 安全停止脚本
+# 关闭 sing-box 并把 DNS 接管还原为直连，确保 LAN 客户端永远不会卡在“无网络”状态。
+# 由定时任务（cron）或一次性保险定时器调用。
+
+/etc/init.d/sing-box stop >/dev/null 2>&1
+uci set sing-box.main.enabled='0'
+uci commit sing-box
+
+# 还原 DNS：dnsmasq 恢复监听 53，去掉下发给 LAN 的强制 DNS
+uci set dhcp.@dnsmasq[0].port='53'
+uci -q delete dhcp.lan.dhcp_option
+uci commit dhcp
+/etc/init.d/dnsmasq restart >/dev/null 2>&1
+
+logger -t singbox-safestop "auto-stopped by safety timer; DNS reverted to direct"
+echo "sing-box stopped $(date)" > /tmp/singbox-safestop.log
