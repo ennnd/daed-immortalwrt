@@ -64,9 +64,17 @@ var card = function(title, children, actions) {
 };
 
 var kvRow = function(k, v, style) {
+	/*
+	 * 注意：v 可能是「字符串 / 单个 DOM 节点 / 节点数组」三者之一。
+	 * 必须直接把 v 作为 children 传入，不能包成 [v]——否则当 v 本身是
+	 * 数组（如 [徽章, ' ', 说明span]）会形成嵌套数组，本版本 LuCI 的 E
+	 * 对嵌套数组不会递归展开，而是对数组调用 toString()，把每个 DOM 节点
+	 * 打成 "[object HTMLSpanElement]"。
+	 * v 为 null/undefined 时 LuCI 的 E 会跳过，td 留空（与旧行为一致）。
+	 */
 	return E('tr', {}, [
 		E('td', { 'class': 'th', 'style': 'width:34%;white-space:nowrap' }, k),
-		E('td', { 'style': style || '' }, [ v ])
+		E('td', { 'style': style || '' }, v)
 	]);
 };
 
