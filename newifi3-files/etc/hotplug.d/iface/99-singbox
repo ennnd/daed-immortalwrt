@@ -1,0 +1,28 @@
+#!/bin/sh
+# 让 sing-box 在 WAN 起来之后再（重新）启动。
+#
+# 原因：config.json 里开了 route.auto_detect_interface（TUN + auto_route 下
+# 必须的防环设置）。它依赖系统默认路由已经存在；但开机时 sing-box 的 procd
+# 启动顺序常常早于 WAN 拿到默认路由（DHCP/PPPoE 异步），那一刻
+# DefaultInterface() 返回 nil，sing-box 会报
+#   ERROR network: missing default interface
+# 并 NetworkPause() 暂停所有出站，且存在竞态可能一直不恢复 → 不出网。
+#
+# 这里监听 wan 的 ifup/update：此时默认路由已写好，重启 sing-box 就能让
+# auto_detect_interface 正确找到出口，既不会暂停、也不会把直连流量绕回 TUN。
+# 标准 OpenWrt hotplug 机制，不修改 sing-box 包自带的 init 脚本。
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "update" ] || exit 0
+[ "$INTERFACE" = "wan" ] || exit 0
+
+# 仅当 sing-box 被启用时才干预
+[ "$(uci -q get sing-box.main.enabled)" = "1" ] || exit 0
+
+# 等默认路由真正写好（PPPoE 比 DHCP 慢），最多 15s
+i=0
+while ! ip route show default >/dev/null 2>&1; do
+	[ "$((i++))" -ge 15 ] && break
+	sleep 1
+done
+
+/etc/init.d/sing-box restart >/dev/null 2>&1
