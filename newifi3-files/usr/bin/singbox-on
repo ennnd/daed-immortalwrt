@@ -40,6 +40,38 @@ uci add_list dhcp.lan.dhcp_option='6,223.5.5.5'
 uci commit dhcp
 /etc/init.d/dnsmasq restart
 
+# 确保 TUN 设备被放进独立防火墙区（不 masquerade），允许 LAN->TUN 转发。
+# 否则 sing-box 运行时，路由器自身有网但 LAN 客户端全部上不了网。
+ensure_singbox_fw() {
+  local z="" i
+  for i in 0 1 2 3 4 5 6 7 8 9; do
+    [ "$(uci -q get firewall.@zone[$i].name)" = "singbox" ] && { z=$i; break; }
+  done
+  if [ -z "$z" ]; then
+    z=$(uci add firewall zone)
+    uci set firewall.$z.name='singbox'
+  fi
+  uci set firewall.$z.input='REJECT'
+  uci set firewall.$z.output='ACCEPT'
+  uci set firewall.$z.forward='DROP'
+  uci set firewall.$z.masq='0'
+  if ! uci -d '\n' get firewall.$z.device 2>/dev/null | grep -qx tun0; then
+    uci add_list firewall.$z.device='tun0'
+  fi
+  local f=""
+  for i in 0 1 2 3 4 5 6 7 8 9; do
+    if [ "$(uci -q get firewall.@forwarding[$i].src)" = "lan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
+  done
+  if [ -z "$f" ]; then
+    f=$(uci add firewall forwarding)
+    uci set firewall.$f.src='lan'
+    uci set firewall.$f.dest='singbox'
+  fi
+  uci commit firewall
+  fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
+}
+ensure_singbox_fw
+
 echo "--- sing-box status ---"
 /etc/init.d/sing-box status || true
 echo "--- last log ---"

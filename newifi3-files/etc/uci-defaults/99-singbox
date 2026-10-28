@@ -1,0 +1,31 @@
+#!/bin/sh
+# uci-defaults: 为 sing-box 的 TUN 设备创建独立防火墙区（不 masquerade），
+# 并允许 lan -> 该区转发。否则 sing-box 运行时，路由器自身有网，
+# 但 LAN 客户端（接在 br-lan 下的设备）全部上不了网。
+# 该脚本在首次刷机启动时执行一次。
+z=""
+for i in 0 1 2 3 4 5 6 7 8 9; do
+  [ "$(uci -q get firewall.@zone[$i].name)" = "singbox" ] && { z=$i; break; }
+done
+if [ -z "$z" ]; then
+  z=$(uci add firewall zone)
+  uci set firewall.$z.name='singbox'
+fi
+uci set firewall.$z.input='REJECT'
+uci set firewall.$z.output='ACCEPT'
+uci set firewall.$z.forward='DROP'
+uci set firewall.$z.masq='0'
+if ! uci -d '\n' get firewall.$z.device 2>/dev/null | grep -qx tun0; then
+  uci add_list firewall.$z.device='tun0'
+fi
+f=""
+for i in 0 1 2 3 4 5 6 7 8 9; do
+  if [ "$(uci -q get firewall.@forwarding[$i].src)" = "lan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
+done
+if [ -z "$f" ]; then
+  f=$(uci add firewall forwarding)
+  uci set firewall.$f.src='lan'
+  uci set firewall.$f.dest='singbox'
+fi
+uci commit firewall
+exit 0
