@@ -94,10 +94,14 @@ return view.extend({
 	buildNodes: function(data) {
 		var self = this;
 		var nodes = core.proxyNodes(data.cfg);
+		var ph = core.scanPlaceholders(data.cfg);
+		var phTags = ph.map(function(p) { return p.tag; });
 
 		var rows = nodes.map(function(n) {
+			var todo = phTags.indexOf(n.tag) >= 0;
+
 			return [
-				n.tag,
+				todo ? E('span', {}, [ n.tag + ' ', sbui.warn(_('待填写')) ]) : n.tag,
 				n.type,
 				core.outboundSummary(n) || '—',
 				E('span', {}, [
@@ -112,16 +116,57 @@ return view.extend({
 			];
 		});
 
-		return sbui.card(_('节点') + ' (' + nodes.length + ')', [
+		var actions = [
+			sbui.btn(_('添加节点'), 'cbi-button-apply', sbui.action(function() {
+				self.editNode(null);
+			}))
+		];
+
+		if (ph.length) {
+			actions.push(' ');
+			actions.push(sbui.btn(_('删除演示节点') + ' (' + ph.length + ')', 'cbi-button-reset',
+				sbui.action(function() {
+					return self.removeDemoNodes(ph);
+				})));
+		}
+
+		var card = sbui.card(_('节点') + ' (' + nodes.length + ')', [
+			ph.length
+				? sbui.warn(_('这些节点还是出厂演示值，sing-box 会拒绝启动：') + core.placeholderText(ph))
+				: '',
 			sbui.table([ _('名称'), _('类型'), _('地址 / 参数'), _('操作') ], rows,
 				_('还没有节点。可以手工添加，或在下面粘贴订阅链接批量导入。')),
-			E('div', { 'style': 'margin-top:1em' }, [
-				sbui.btn(_('添加节点'), 'cbi-button-apply', sbui.action(function() {
-					self.editNode(null);
-				}))
-			]),
+			E('div', { 'style': 'margin-top:1em' }, actions),
 			sbui.hint(_('这里的每个改动都会重写 /etc/sing-box/config.json：先备份到 backup/，再 sing-box check，通过后才替换并重启。注释会丢。'))
 		]);
+
+		return card;
+	},
+
+	/* 一次性清掉出厂演示节点（值里带 YOUR_ 的那些），并顺手修好 members */
+	removeDemoNodes: function(ph) {
+		var self = this;
+
+		if (!confirm(_('确定删除这 ') + ph.length + _(' 个未填写的演示节点吗？') + '\n' + core.placeholderText(ph)))
+			return Promise.resolve();
+
+		return api.readConfig().then(function(r) {
+			if (r.error)
+				throw new Error(_('当前 config.json 不是合法 JSON：') + r.error);
+
+			ph.forEach(function(p) {
+				if (p.where === 'outbound' && p.tag)
+					core.removeOutbound(r.cfg, p.tag);
+			});
+
+			core.normalizeMembers(r.cfg);
+
+			return api.saveConfig(r.cfg, _('删除演示节点')).then(function() {
+				return self.reload();
+			}).then(function() {
+				sbui.notifyOk(_('已删除 ') + ph.length + _(' 个演示节点'));
+			});
+		});
 	},
 
 	fieldRow: function(title, node) {
@@ -289,14 +334,25 @@ return view.extend({
 				node.tls.insecure = true;
 
 			if (sec === 'reality') {
-				if (!f.pbk.value)
+				var pbk = core.trimStr(f.pbk.value);
+				var sid = core.trimStr(f.sid.value);
+
+				if (!pbk)
 					throw new Error(_('Reality 需要 public_key'));
+
+				/* sing-box 只会说 invalid public_key，先在这里挡住 */
+				if (!core.realityKeyOk(pbk))
+					throw new Error(_('Reality 公钥必须是 43 位 base64url 字符（当前 ') + pbk.length +
+						_(' 位）。可在路由器执行 sing-box generate reality-keypair 生成一对'));
+
+				if (!core.shortIdOk(sid))
+					throw new Error(_('Reality short_id 必须是偶数位十六进制（最多 16 位），当前：') + (sid || '（空）'));
 
 				node.tls.utls = { enabled: true, fingerprint: core.trimStr(f.fp.value) || 'chrome' };
 				node.tls.reality = {
 					enabled: true,
-					public_key: core.trimStr(f.pbk.value),
-					short_id: core.trimStr(f.sid.value)
+					public_key: pbk,
+					short_id: sid
 				};
 			}
 			else if (f.fp.value) {
@@ -494,6 +550,9 @@ return view.extend({
 					return self.applyParsed(idx, parsed, syncCb.checked).then(function(res) {
 						ui.hideModal();
 						sbui.notifyOk(_('已写入 ') + res.added.length + _(' 个新节点，覆盖 ') + res.replaced.length + _(' 个') +
+							(res.removedDemo && res.removedDemo.length
+								? _('，并清掉 ') + res.removedDemo.length + _(' 个未填写的演示节点')
+								: '') +
 							(res.fixes.length ? _('，修正 ') + res.fixes.length + _(' 处成员引用') : ''));
 						return self.reload();
 					});
@@ -510,6 +569,24 @@ return view.extend({
 				throw new Error(_('当前 config.json 不是合法 JSON：') + r.error);
 
 			var res = core.mergeNodes(r.cfg, parsed.nodes, { syncMembers: syncMembers !== false });
+
+			/*
+			 * 导入时顺手清掉没填写的出厂演示节点。留着它们的话，
+			 * 配置依然会因为 invalid public_key 无法启动——这就是导入成功、
+			 * 点启用却报 FATAL initialize outbound[2] 的典型原因。
+			 */
+			var demo = core.scanPlaceholders(r.cfg).filter(function(p) {
+				return p.where === 'outbound' && p.tag;
+			});
+
+			if (demo.length) {
+				demo.forEach(function(p) {
+					core.removeOutbound(r.cfg, p.tag);
+				});
+
+				core.normalizeMembers(r.cfg);
+				res.removedDemo = demo.map(function(p) { return p.tag; });
+			}
 
 			return api.saveConfig(r.cfg, _('订阅更新')).then(function() {
 				self.data.subs.settings.sync_members = syncMembers !== false;

@@ -225,7 +225,71 @@ const dup = [
 core.assignTags(dup);
 eq('tag 去重', dup.map(n => n.tag), [ '同名', '同名-2', 'node-3' ]);
 
-/* ---------- 5. 产出样例配置给 sing-box check 用 ---------- */
+/* ---------- 5. 字段校验与错误诊断（实机报错的回归测试） ---------- */
+
+/* 2026-10-28 设备上真实出现的报错：
+   FATAL[0000] initialize outbound[2]: invalid public_key
+   对应的就是出厂模板第三个 outbound（node1）的 Reality 占位符 */
+ok('43 位 base64url 公钥通过', core.realityKeyOk('AcSDB92IB-REhNbdYjXb_6PjAVzYkHtbrbYDbSqwQ04'));
+ok('占位符不是合法公钥', !core.realityKeyOk('YOUR_REALITY_PUBLIC_KEY'));
+ok('带 padding 的公钥被拒', !core.realityKeyOk('AcSDB92IB-REhNbdYjXb_6PjAVzYkHtbrbYDbSqwQ04='));
+ok('42 位被拒', !core.realityKeyOk('AcSDB92IB-REhNbdYjXb_6PjAVzYkHtbrbYDbSqwQ0'));
+
+ok('short_id 十六进制通过', core.shortIdOk('ab12cd34'));
+ok('short_id 允许为空', core.shortIdOk(''));
+ok('short_id 奇数位被拒', !core.shortIdOk('abc'));
+ok('short_id 非十六进制被拒', !core.shortIdOk('zzzz'));
+
+const diag = core.explainCheckError(realCfgText, 'FATAL[0000] initialize outbound[2]: invalid public_key');
+eq('诊断定位到 outbound 下标', diag.index, 2);
+eq('诊断带出 tag', diag.tag, 'node1');
+eq('诊断带出类型', diag.type, 'vless');
+ok('诊断给出中文提示', /43 位 base64url/.test(diag.hint), diag.hint);
+
+const diagDup = core.explainCheckError(realCfgText,
+	'FATAL[0000] decode config at /tmp/x.json: duplicate outbound/endpoint tag: node2');
+ok('重名 tag 有提示', /tag 重名/.test(diagDup.hint), diagDup.hint);
+eq('重名时不误报下标', diagDup.index, -1);
+
+const ph = core.scanPlaceholders(core.parseJsonc(realCfgText));
+eq('模板里 3 个演示节点', ph.length, 3);
+ok('占位符字段被列出', ph[0].fields.indexOf('YOUR_REALITY_PUBLIC_KEY') >= 0, JSON.stringify(ph[0].fields));
+ok('占位符文本带 tag', /node1\(/.test(core.placeholderText(ph)), core.placeholderText(ph));
+
+/* 订阅里 pbk 被截断的节点应被跳过，而不是让整份配置 check 失败 */
+const badPbkUri = 'vless://11111111-2222-3333-4444-555555555555@a.example.com:443'
+	+ '?security=reality&sni=www.bing.com&fp=chrome&pbk=tooshort&sid=ab12&type=tcp#坏公钥';
+const badPbk = core.parseUri(badPbkUri);
+eq('坏公钥节点被跳过', badPbk.skip, 'bad-reality-key');
+ok('跳过原因可读', /43 位/.test(core.skipReasonText('bad-reality-key')));
+
+const badSidUri = 'vless://11111111-2222-3333-4444-555555555555@a.example.com:443'
+	+ '?security=reality&sni=www.bing.com&fp=chrome'
+	+ '&pbk=AcSDB92IB-REhNbdYjXb_6PjAVzYkHtbrbYDbSqwQ04&sid=zz&type=tcp#坏shortid';
+eq('坏 short_id 节点被跳过', core.parseUri(badSidUri).skip, 'bad-short-id');
+
+/* 删光所有节点后，selector/urltest 必须留 direct，否则 sing-box 报 missing tags */
+const emptyCfg = core.parseJsonc(realCfgText);
+core.scanPlaceholders(emptyCfg).forEach(p => core.removeOutbound(emptyCfg, p.tag));
+const emptyAuto = emptyCfg.outbounds.filter(o => o.tag === 'auto')[0];
+const emptyProxy = emptyCfg.outbounds.filter(o => o.tag === 'proxy')[0];
+eq('空 urltest 回落到 direct', emptyAuto.outbounds, [ 'direct' ]);
+eq('空 selector 回落到 auto', emptyProxy.outbounds, [ 'auto' ]);
+ok('missing tags 有中文提示',
+	/添加节点/.test(core.explainCheckError(realCfgText, 'FATAL[0000] initialize outbound[1]: missing tags').hint));
+
+/* 订阅导入时清掉未填写的演示节点（与 nodes.js applyParsed 的清理逻辑一致） */
+const importCfg = core.parseJsonc(realCfgText);
+core.mergeNodes(importCfg, rPlain.nodes, { syncMembers: true });
+core.scanPlaceholders(importCfg).filter(p => p.where === 'outbound' && p.tag)
+	.forEach(p => core.removeOutbound(importCfg, p.tag));
+core.normalizeMembers(importCfg);
+eq('导入后演示节点被清干净', core.scanPlaceholders(importCfg).length, 0);
+ok('导入后订阅节点还在', importCfg.outbounds.some(o => o.tag === 'Hy2'));
+ok('导入后没有空组', importCfg.outbounds.filter(o => o.type === 'selector' || o.type === 'urltest')
+	.every(o => o.outbounds.length > 0));
+
+/* ---------- 6. 产出样例配置给 sing-box check 用 ---------- */
 
 const samplePath = process.env.SINGBOX_SAMPLE || path.join(require('os').tmpdir(), 'luci-singbox-sample.json');
 const outCfg = core.parseJsonc(realCfgText);

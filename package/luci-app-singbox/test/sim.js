@@ -324,6 +324,9 @@ function load(name) {
 	await nodesView.applyParsed(0, parsed, true);
 	after = core.parseJsonc(files['/etc/sing-box/config.json']);
 	check('applyParsed 写入订阅节点', after.outbounds.some(o => o.tag === 'Hy2'));
+	/* 模拟环境里演示节点已被填成合法值，所以这里验证的是"不会误删用户已填的节点" */
+	check('applyParsed 不误删已填写的节点', after.outbounds.some(o => o.tag === 'node1'));
+	check('applyParsed 后不再有占位符', core.scanPlaceholders(after).length === 0);
 	check('applyParsed 记录 last_update', nodesView.data.subs.subscriptions[0].count === 6);
 
 	const outFile = process.env.SIM_OUT ||

@@ -156,7 +156,7 @@ singbox-off
 | 页签 | 能做什么 |
 |---|---|
 | **状态** | 服务状态 / PID / 版本 / TUN 接口 / dnsmasq 是否已被接管 / urltest 最近选中项；启用、停用、重启按钮；最近日志 |
-| **节点与订阅** | 节点表格（增删改，类型联动字段：vless / vmess / trojan / shadowsocks / hysteria2 / tuic）；订阅：粘贴 URL → 立即更新 → 预览（识别 N 个、跳过 M 个及原因）→ 写入 |
+| **节点与订阅** | 节点表格（增删改，类型联动字段：vless / vmess / trojan / shadowsocks / hysteria2 / tuic）；未填写的演示节点会标「待填写」并可一键「删除演示节点」；订阅：粘贴 URL → 立即更新 → 预览（识别 N 个、跳过 M 个及原因）→ 写入（同时清掉演示节点） |
 | **分流与 DNS** | 三种分流模式（全局代理 / 大陆直连 / 全部直连）；rule-set（geosite-cn、geoip-cn）一键更新；DNS 服务器、strategy、optimistic、timeout |
 | **高级** | config.json 原始编辑器（带校验）、恢复出厂配置、备份列表与回滚 |
 
@@ -167,6 +167,8 @@ singbox-off
 | base64 包装的 URI 列表 | 机场最通用，UA 用 `v2rayN/6.0` 一般就是这个格式 |
 | 明文 URI 列表 | 每行一个 `vless://` / `vmess://` / `trojan://` / `ss://` / `hysteria2://` / `tuic://` |
 | sing-box 配置 JSON | 含 `outbounds` 的对象，直接取其中的代理出站 |
+
+Reality 节点的 `pbk` 必须是 43 位 base64url，不合格的会被跳过（原因 `bad-reality-key`）——否则整份配置会在 `check` 阶段因为一句 `invalid public_key` 全盘失败。
 
 **不支持 Clash YAML**（要在前端写 YAML 解析器不划算，检测到会提示改用 URI/JSON 格式）。
 
@@ -186,9 +188,30 @@ mv config.json.tmp config.json      ← 原子替换
 
 ### 4.3 恢复出厂
 
-出厂原件取自 **`/rom/etc/sing-box/config.json`**——这是 squashfs 只读层（overlayfs 的 lower），只有被写过才会 copy-up，所以它永远是出厂那份，不占 overlay 空间。恢复后配置回到带 `YOUR_*` 占位符的模板，需要重新填节点。
+出厂原件取自 **`/rom/etc/sing-box/config.json`**——这是 squashfs 只读层（overlayfs 的 lower），只有被写过才会 copy-up，所以它永远是出厂那份，不占 overlay 空间。恢复后配置回到带 `YOUR_*` 占位符的模板（3 个演示节点也在），**不填就无法启动**；可以先在节点页点「删除演示节点」，再导入订阅。
 
-### 4.4 已知限制
+### 4.4 面板报错怎么读
+
+`sing-box check` 的原始输出只有一句 `initialize outbound[2]: invalid public_key`，看不出是哪个节点。面板会把下标翻回 tag，并补上字段级建议：
+
+```
+节点「node1」（vless）配置有误；Reality 公钥不合法：应为 43 位 base64url 字符
+（A-Z a-z 0-9 - _），可用 sing-box generate reality-keypair 生成；
+还有未填的占位符：node1(YOUR_SERVER/YOUR_UUID/...)，node2(...)，node3(...)（出厂演示节点，改成真实参数或直接删掉）；
+sing-box 原始错误：FATAL[0000] initialize outbound[2]: invalid public_key
+```
+
+| 报错 | 含义 | 处理 |
+|---|---|---|
+| `initialize outbound[N]: invalid public_key` | 该节点的 Reality 公钥不是 43 位 base64url（出厂占位符、复制被截断都会这样） | 填真实 `pbk`，或删掉演示节点 |
+| `initialize outbound[N]: decode short_id ...` | short_id 必须是偶数位十六进制（≤16 位） | 改 `sid`，留空也行 |
+| `initialize outbound[N]: missing tags` | 某个 `selector` / `urltest` 没有任何成员（通常是删光了节点） | 面板会自动补 `direct` 兜底；仍报错就先加节点 |
+| `duplicate outbound/endpoint tag: xxx` | tag 重名 | 改名 |
+| 面板通知「配置里还有未填的占位符」 | 出厂模板的 3 个演示节点没填 | 节点页点「删除演示节点」，或逐个填好 |
+
+出厂模板带 3 个演示节点（node1 VLESS+Reality、node2 Shadowsocks、node3 VLESS），值全是 `YOUR_*` 占位符。**它们不填就是坏的**，而 `sing-box check` 只要遇到一个就整份拒绝。所以正常流程是：订阅导入（会自动清掉这些演示节点）→ 启用；手工加节点前也可以先点一次「删除演示节点」。
+
+### 4.5 已知限制
 
 - **没有实时面板**：没启用 `experimental.clash_api`，所以没有流量曲线、连接列表，也**没有节点延迟测试**。判断节点好坏只能看日志里 urltest 的选择结果。
 - **不支持 gRPC 传输的节点**：tiny 变体在 mips 上没有 `with_gvisor` / `with_grpc`，解析器会把 `net=grpc` 的节点跳过并计数（机场里这类节点占比不低，请留意预览页的"跳过原因"）。
@@ -196,9 +219,9 @@ mv config.json.tmp config.json      ← 原子替换
 - TUN 只能 `stack: system`（没有 gvisor）。
 - **UI 保存会重写 config.json，注释会丢**（前端没有能保留注释的 JSON 库）；想保留注释就 SSH 手改，或用「高级」页的原始编辑器（保存时同样会丢，但至少能贴回来）。
 
-### 4.5 为什么没有 ucode/rpcd 后端
+### 4.6 为什么没有 ucode/rpcd 后端
 
-面板是纯前端（AMD 模块）+ LuCI 自带的 `fs` / `uci` RPC，没有需要交叉编译的 C 代码或 ucode 脚本。这样做的直接好处：**解析逻辑可以用 node 在本机单测**（`test/run.js`，60 条断言覆盖 JSONC 剥注释、base64、7 种 URI 解析、订阅三格式、合并与 members 修正），CI 里还会拿官方 1.14.3 二进制对"真实模板 + 解析出的节点"跑一次 `sing-box check`。权限由 ACL 精确到具体路径与可执行文件。
+面板是纯前端（AMD 模块）+ LuCI 自带的 `fs` / `uci` RPC，没有需要交叉编译的 C 代码或 ucode 脚本。这样做的直接好处：**解析逻辑可以用 node 在本机单测**（`test/run.js`，86 条断言覆盖 JSONC 剥注释、base64、7 种 URI 解析、订阅三格式、合并与 members 修正），CI 里还会拿官方 1.14.3 二进制对"真实模板 + 解析出的节点"跑一次 `sing-box check`。权限由 ACL 精确到具体路径与可执行文件。
 
 ---
 

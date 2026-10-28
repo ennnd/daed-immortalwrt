@@ -452,6 +452,14 @@ function buildTls(opt) {
 		if (!opt.pbk)
 			return 'reality-key';
 
+		/* 机场里常见 pbk 被截断/带了多余字符，交给 sing-box 只会得到
+		   initialize outbound[N]: invalid public_key，这里提前判掉 */
+		if (!realityKeyOk(opt.pbk))
+			return 'bad-reality-key';
+
+		if (opt.sid && !shortIdOk(opt.sid))
+			return 'bad-short-id';
+
 		var rtls = {
 			enabled: true,
 			utls: {
@@ -522,8 +530,8 @@ function parseVless(body) {
 		insecure: isTrue(q.allowInsecure) || isTrue(q.insecure)
 	});
 
-	if (tls === 'reality-key')
-		return { skip: 'reality-key' };
+	if (typeof tls === 'string')
+		return { skip: tls };
 
 	var node = {
 		type: 'vless',
@@ -1023,6 +1031,8 @@ var SKIP_REASONS = {
 	'scheme': '不认识的协议',
 	'no-auth': '缺少凭据',
 	'reality-key': 'Reality 缺 public_key',
+	'bad-reality-key': 'Reality 公钥不是 43 位 base64url（多半是复制时被截断）',
+	'bad-short-id': 'Reality short_id 不是十六进制',
 	'bad-uri': '链接格式错误'
 };
 
@@ -1112,6 +1122,15 @@ function normalizeMembers(cfg) {
 
 			if (kept.length)
 				fixes.push(ob.tag + ': 成员为空，自动补入 ' + kept.length + ' 个节点');
+		}
+
+		/*
+		 * 一个节点都没有（例如刚把演示节点全删掉）时，组里留 direct，
+		 * 否则 sing-box 报 initialize outbound[N]: missing tags，配置连 check 都过不了。
+		 */
+		if (!kept.length && tags['direct'] && ob.tag !== 'direct') {
+			kept.push('direct');
+			fixes.push(ob.tag + ': 没有可用节点，暂时指向 direct');
 		}
 
 		ob.outbounds = kept;
@@ -1256,6 +1275,152 @@ function proxyNodes(cfg) {
 	return out;
 }
 
+/* ---------------- 字段校验与错误诊断 ---------------- */
+
+/*
+ * Reality public_key 是 32 字节 X25519 公钥的 base64url（无 padding）编码，
+ * 固定 43 个字符。写错时 sing-box 只回一句 "invalid public_key"，
+ * 完全看不出是哪个节点的哪个字段，所以先在客户端挡一道。
+ */
+var REALITY_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
+var SHORT_ID_RE = /^([0-9a-fA-F]{2}){0,8}$/;
+
+function realityKeyOk(k) {
+	return REALITY_KEY_RE.test(trimStr(k || ''));
+}
+
+function shortIdOk(s) {
+	return SHORT_ID_RE.test(trimStr(s || ''));
+}
+
+/*
+ * 把 sing-box 的原始报错翻成人话。
+ * 输入：配置文本 + check 的 stderr；输出：
+ *   { raw, kind, index, tag, type, hint }
+ * kind 为 'outbound' / 'inbound' / 'dns' / 'rule-set' / ''。
+ */
+var CHECK_HINTS = [
+	[ /invalid public_key/i,
+	  'Reality 公钥不合法：应为 43 位 base64url 字符（A-Z a-z 0-9 - _），可用 sing-box generate reality-keypair 生成' ],
+	[ /decode short_id/i,
+	  'Reality short_id 必须是偶数位的十六进制字符串（最多 16 位，例如 ab12cd34）' ],
+	[ /invalid uuid|parse uuid|invalid UUID/i,
+	  'UUID 格式不对，应为 8-4-4-4-12 的十六进制' ],
+	[ /duplicate outbound\/endpoint tag|duplicate .* tag/i,
+	  'tag 重名：每个节点/出站的 tag 必须唯一' ],
+	[ /no such file or directory/i,
+	  '引用的文件不存在（常见于 rule-set 尚未下载）' ],
+	[ /unknown field/i,
+	  '配置里出现了当前版本不认识的字段（可能是旧版写法，或 tiny 构建没编这个特性）' ],
+	[ /unknown (transport|outbound|inbound) type|unsupported/i,
+	  '当前固件不支持这个协议特性（tiny 构建裁剪了很多无关模块）' ],
+	[ /invalid (port|server_port)/i, '端口不合法，应为 1~65535' ],
+	[ /missing tags/i, '有一个 selector/urltest 出站成员为空，请先在「节点」页添加节点' ],
+	[ /cannot unmarshal|json:/i, '配置不是合法 JSON，或字段类型不对（字符串/数字写反了）' ]
+];
+
+function explainCheckError(cfgText, errText) {
+	var raw = trimStr(errText || '');
+	var info = { raw: raw, kind: '', index: -1, tag: '', type: '', hint: '' };
+	var cfg = null, m;
+
+	try {
+		cfg = parseJsonc(cfgText || '');
+	}
+	catch (e) {
+		cfg = null;
+	}
+
+	if (raw && cfg) {
+		m = /initialize\s+(outbound|inbound|dns|rule-set)\s*\[(\d+)\]/i.exec(raw);
+
+		if (m) {
+			var kind = m[1].toLowerCase();
+			var idx = parseInt(m[2], 10);
+			var list = null;
+
+			if (kind === 'outbound')
+				list = cfg.outbounds;
+			else if (kind === 'inbound')
+				list = cfg.inbounds;
+			else if (kind === 'rule-set')
+				list = cfg.route && cfg.route.rule_set;
+			else if (kind === 'dns')
+				list = cfg.dns && cfg.dns.servers;
+
+			var item = list && list[idx];
+
+			if (item) {
+				info.kind = kind;
+				info.index = idx;
+				info.tag = item.tag || '';
+				info.type = item.type || '';
+			}
+		}
+	}
+
+	for (var i = 0; i < CHECK_HINTS.length; i++) {
+		if (CHECK_HINTS[i][0].test(raw)) {
+			info.hint = CHECK_HINTS[i][1];
+			break;
+		}
+	}
+
+	return info;
+}
+
+/*
+ * 找出所有还没填的出厂占位符（"YOUR_XXX"），返回
+ *   [ { where: 'outbound', index: 2, tag: 'node1', fields: ['YOUR_SERVER', ...] } ]
+ */
+function scanPlaceholders(cfg) {
+	var found = [];
+
+	function scan(list, where) {
+		(list || []).forEach(function(o, i) {
+			var s;
+
+			try {
+				s = JSON.stringify(o);
+			}
+			catch (e) {
+				return;
+			}
+
+			var names = s.match(/"YOUR_[A-Z0-9_]*"/g);
+
+			if (!names)
+				return;
+
+			var fields = [];
+
+			names.forEach(function(n) {
+				var f = n.replace(/"/g, '');
+
+				if (fields.indexOf(f) < 0)
+					fields.push(f);
+			});
+
+			found.push({ where: where, index: i, tag: o.tag || '', fields: fields });
+		});
+	}
+
+	if (!cfg)
+		return found;
+
+	scan(cfg.outbounds, 'outbound');
+	scan(cfg.inbounds, 'inbound');
+	scan(cfg.dns && cfg.dns.servers, 'dns');
+
+	return found;
+}
+
+function placeholderText(found) {
+	return (found || []).map(function(f) {
+		return (f.tag || ('#' + (f.index + 1))) + '(' + f.fields.join('/') + ')';
+	}).join('，');
+}
+
 /*
  * 必须 return 一个 class：LuCI 的 require() 会 new 它再返回实例，
  * 直接 return 普通对象会报 "factory yields invalid constructor"。
@@ -1289,5 +1454,10 @@ return baseclass.extend({
 	mergeNodes: mergeNodes,
 	removeOutbound: removeOutbound,
 	outboundSummary: outboundSummary,
-	proxyNodes: proxyNodes
+	proxyNodes: proxyNodes,
+	realityKeyOk: realityKeyOk,
+	shortIdOk: shortIdOk,
+	explainCheckError: explainCheckError,
+	scanPlaceholders: scanPlaceholders,
+	placeholderText: placeholderText
 });

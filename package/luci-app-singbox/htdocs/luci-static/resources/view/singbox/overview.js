@@ -1,6 +1,7 @@
 'use strict';
 'require view';
 'require singbox.api as api';
+'require singbox.core as core';
 'require singbox.ui as sbui';
 
 return view.extend({
@@ -27,7 +28,16 @@ return view.extend({
 	},
 
 	render: function(data) {
-		this.placeholder = /"YOUR_/.test(data.text);
+		var cfg = null;
+
+		try {
+			cfg = core.parseJsonc(data.text || '');
+		}
+		catch (e) {
+			cfg = null;
+		}
+
+		this.placeholders = core.scanPlaceholders(cfg);
 		this.bodyNode = E('div', {});
 		this.logNode = E('pre', {
 			'style': 'white-space:pre-wrap;word-break:break-all;max-height:22em;overflow:auto;font-size:11px;margin:0'
@@ -115,9 +125,10 @@ return view.extend({
 			sbui.hint(_('启用会复用 singbox-on 的逻辑：先确认 sing-box 起来了，再让 dnsmasq 交出 DNS（port=0，LAN 走 223.5.5.5）。启动失败自动回滚，dnsmasq 不会被改。'))
 		];
 
-		if (this.placeholder) {
+		if (this.placeholders.length) {
 			children.unshift(sbui.warn(
-				_('配置里还有 YOUR_* 占位符，启用会被拒绝。请先到「节点」页添加节点或订阅，或在「高级」页直接编辑 config.json。')));
+				_('配置里还有未填的占位符：') + core.placeholderText(this.placeholders) +
+				_('。sing-box 会拒绝启动（例如 invalid public_key）。请到「节点与订阅」页填成真实参数，或点「删除演示节点」一键清掉。')));
 		}
 		else if (!st.running && st.uci_enabled) {
 			children.unshift(sbui.warn(

@@ -46,7 +46,7 @@ return view.extend({
 						if (res.code === 0)
 							sbui.notifyOk(_('sing-box check 通过'));
 						else
-							throw new Error(String(res.stderr || res.stdout || _('校验失败')).trim());
+							throw api.checkFailure(self.textArea.value, res);
 					});
 				})),
 				' ',

@@ -190,6 +190,44 @@ api.checkText = function(text) {
 };
 
 /*
+ * 把 sing-box check 的失败输出翻成可操作的错误。
+ * 原始输出只有 "initialize outbound[2]: invalid public_key" 这种，
+ * 看不出是哪个节点，所以这里补上 tag、类型、字段问题，以及是否还有占位符。
+ */
+api.checkFailure = function(text, res) {
+	var raw = core.trimStr((res && (res.stderr || res.stdout)) || '');
+	var info = core.explainCheckError(text, raw);
+	var cfg = null, parts = [];
+
+	try {
+		cfg = core.parseJsonc(text || '');
+	}
+	catch (e) {
+		cfg = null;
+	}
+
+	if (info.tag)
+		parts.push(_('节点「') + info.tag + '」' +
+			(info.type ? '（' + info.type + '）' : '') + _('配置有误'));
+	else if (info.kind)
+		parts.push(_('第 ') + (info.index + 1) + _(' 项 ') + info.kind + _(' 配置有误'));
+
+	if (info.hint)
+		parts.push(info.hint);
+
+	var ph = core.scanPlaceholders(cfg);
+
+	if (ph.length)
+		parts.push(_('还有未填的占位符：') + core.placeholderText(ph) +
+			_('（出厂演示节点，改成真实参数或直接删掉）'));
+
+	if (raw)
+		parts.push(_('sing-box 原始错误：') + raw);
+
+	return new Error(parts.join(_('；')) || _('sing-box check 失败'));
+};
+
+/*
  * 唯一的写配置入口。返回 { restarted: bool, checked: bool }
  * 任何一步失败都会抛错，且原文件保持不变（.tmp 会被删掉）。
  */
@@ -201,9 +239,7 @@ api.saveText = function(text, note) {
 	}).then(function(res) {
 		if (res.code !== 0) {
 			return fs.remove(TMP).catch(function() {}).then(function() {
-				var msg = core.trimStr((res.stderr || '') + '\n' + (res.stdout || ''));
-
-				throw new Error(msg || _('sing-box check 失败'));
+				throw api.checkFailure(text, res);
 			});
 		}
 
@@ -343,18 +379,24 @@ api.status = function() {
 /* 启用：完全按 /usr/bin/singbox-on 的顺序，失败回滚，绝不先动 dnsmasq */
 api.enable = function() {
 	var self = api;
+	var cfgText = '';
 
 	return self.readConfig().then(function(cfgres) {
-		if (/"YOUR_/.test(cfgres.text || ''))
-			throw new Error(_('配置里还有 YOUR_* 占位符，请先填好节点再启用'));
+		var ph = core.scanPlaceholders(cfgres.cfg);
+
+		if (ph.length)
+			throw new Error(_('配置里还有未填的占位符：') + core.placeholderText(ph) +
+				_('。请到「节点」页把它们改成真实参数，或用「删除演示节点」清掉'));
 
 		if (cfgres.error)
 			throw new Error(_('配置不是合法 JSON') + ': ' + cfgres.error);
 
+		cfgText = cfgres.text;
+
 		return self.exec('/usr/bin/sing-box', [ 'check', '-c', CFG ]);
 	}).then(function(res) {
 		if (res.code !== 0)
-			throw new Error(core.trimStr(res.stderr || res.stdout) || _('sing-box check 失败'));
+			throw self.checkFailure(cfgText, res);
 
 		return self.uci([ 'set', 'sing-box.main.enabled=1' ]);
 	}).then(function() {
