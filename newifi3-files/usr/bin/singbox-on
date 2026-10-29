@@ -18,9 +18,11 @@ fi
 # 否则 sing-box 运行时，路由器自身 / LAN 客户端的流量可能被拒绝或丢弃。
 ensure_singbox_fw() {
   local z="" i f=""
-  for i in 0 1 2 3 4 5 6 7 8 9; do
-    [ "$(uci -q get firewall.@zone[$i].name)" = "singbox" ] && { z=$i; break; }
-  done
+  # 用 section 名定位，不能用数字下标：
+  #   uci set firewall.2.input=... 会报 "uci: Invalid argument"，
+  #   合法写法只有 firewall.@zone[2].input 或 firewall.cfgXXXX.input。
+  #   （区已存在时取到的是 @zone[N]，不存在时 uci add 返回 cfgXXXX，两种都能用。）
+  z=$(uci -q show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\|cfg[0-9a-fA-F]*\)\.name='singbox'$/\1/p" | head -1)
   if [ -z "$z" ]; then
     z=$(uci add firewall zone)
     uci set firewall.$z.name='singbox'
@@ -35,7 +37,7 @@ ensure_singbox_fw() {
   # lan -> singbox
   f=""
   for i in 0 1 2 3 4 5 6 7 8 9; do
-    if [ "$(uci -q get firewall.@forwarding[$i].src)" = "lan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
+    if [ "$(uci -q get firewall.@forwarding[$i].src 2>/dev/null)" = "lan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest 2>/dev/null)" = "singbox" ]; then f=$i; break; fi
   done
   if [ -z "$f" ]; then
     f=$(uci add firewall forwarding)
@@ -45,7 +47,7 @@ ensure_singbox_fw() {
   # wan -> singbox：放行路由器自身经 TUN 出站的回程流量
   f=""
   for i in 0 1 2 3 4 5 6 7 8 9; do
-    if [ "$(uci -q get firewall.@forwarding[$i].src)" = "wan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
+    if [ "$(uci -q get firewall.@forwarding[$i].src 2>/dev/null)" = "wan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest 2>/dev/null)" = "singbox" ]; then f=$i; break; fi
   done
   if [ -z "$f" ]; then
     f=$(uci add firewall forwarding)
