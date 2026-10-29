@@ -57,6 +57,16 @@ ensure_singbox_fw() {
 }
 ensure_singbox_fw
 
+# ★ dnsmasq 上游 DNS 改成公网解析器（见 99-singbox 里同一段注释的完整说明）。
+#   不改的话 dnsmasq 问上游路由器(192.168.18.1)的流量会绕过 TUN，
+#   sing-box 的 hijack-dns 抓不到 → 国外域名拿到投毒 IP → 国外全挂。
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci -q delete dhcp.@dnsmasq[0].server
+uci add_list dhcp.@dnsmasq[0].server='223.5.5.5'
+uci add_list dhcp.@dnsmasq[0].server='119.29.29.29'
+uci commit dhcp
+/etc/init.d/dnsmasq restart 2>/dev/null || true
+
 sing-box check -c "$CFG"
 
 uci set sing-box.main.enabled='1'

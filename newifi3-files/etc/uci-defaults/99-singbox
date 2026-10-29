@@ -39,6 +39,24 @@ if [ -z "$f" ]; then
 fi
 uci commit firewall
 
+# ★ 把 dnsmasq 的上游 DNS 指向公网解析器（并禁用读 resolv.conf）。
+#   这是"国外站点全打不开"的真正根因，不改这里 sing-box 装得再对也没用：
+#   上游路由器(192.168.18.1)位于 WAN 子网，dnsmasq 查询它的流量会命中
+#   route 里的 ip_is_private→direct，直接出 WAN **绕过 TUN**，于是 sing-box 的
+#   hijack-dns 规则根本抓不到这些查询。国内域名无所谓，但国外域名会拿到
+#   GFW 投毒 IP（例如 www.google.com → 174.132.167.252、2001::1），
+#   连过去被上游回 admin-prohibited（connect 报 EPERM / "Operation not permitted"），
+#   表现为"开了 sing-box 国外全挂"，还会让看门狗误判"代理坏了"而停掉 sing-box。
+#   改成公网解析器后：查询走 TUN → 被 hijack-dns 接管 → sing-box 按自己的规则
+#   分流（国内→dns_cn 直连、国外→DoH 1.1.1.1 走代理）→ 拿到真实 IP。
+#   注意：这里不接管 53 端口，本机 dnsmasq 继续监听 :53 负责给 LAN 客户端回包。
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci -q delete dhcp.@dnsmasq[0].server
+uci add_list dhcp.@dnsmasq[0].server='223.5.5.5'
+uci add_list dhcp.@dnsmasq[0].server='119.29.29.29'
+uci commit dhcp
+/etc/init.d/dnsmasq restart 2>/dev/null || true
+
 # 启用 cron，安装 sing-box watchdog（每 2 分钟检测国外站点，代理连不上国外但国内正常时自动停止 sing-box）
 if [ -x /etc/init.d/cron ]; then
   cat > /etc/crontabs/root <<'CRON'
