@@ -12,7 +12,7 @@
 				"/rom/etc/sing-box/config.json": [ "read" ],
 				"/tmp/luci-singbox-sub.txt": [ "read" ]
 			},
-			"uci": [ "sing-box", "dhcp" ]
+			"uci": [ "sing-box", "dhcp", "firewall" ]
 		},
 		"write": {
 			"file": {
@@ -25,8 +25,13 @@
 				"/usr/bin/sing-box": [ "exec" ],
 				"/etc/init.d/sing-box": [ "exec" ],
 				"/etc/init.d/dnsmasq": [ "exec" ],
+				"/etc/init.d/firewall": [ "exec" ],
 				"/bin/mv": [ "exec" ],
 				"/bin/mkdir": [ "exec" ],
+
+				"/usr/sbin/fw4": [ "exec" ],
+				"/sbin/fw4": [ "exec" ],
+				"/bin/fw4": [ "exec" ],
 
 				"/bin/pidof": [ "exec" ],
 				"/sbin/pidof": [ "exec" ],
@@ -49,7 +54,7 @@
 
 				"/tmp/luci-singbox-sub.txt": [ "write" ]
 			},
-			"uci": [ "sing-box", "dhcp" ]
+			"uci": [ "sing-box", "dhcp", "firewall" ]
 		}
 	}
 }

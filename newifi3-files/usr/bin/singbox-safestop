@@ -7,9 +7,9 @@
 uci set sing-box.main.enabled='0'
 uci commit sing-box
 
-# 还原 DNS：dnsmasq 恢复监听 53，去掉下发给 LAN 的强制 DNS
+# 还原 DNS：dnsmasq 恢复监听 53，去掉下发给 LAN 的强制 DNS（兼容旧版接管过的机器）
 uci set dhcp.@dnsmasq[0].port='53'
-uci -q delete dhcp.lan.dhcp_option
+uci -q delete dhcp.lan.dhcp_option 2>/dev/null || true
 uci commit dhcp
 /etc/init.d/dnsmasq restart >/dev/null 2>&1
 

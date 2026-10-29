@@ -1476,6 +1476,179 @@ function placeholderText(found) {
 	}).join('，');
 }
 
+/* ---------------- uci show 解析（防火墙区 / DNS 上游） ---------------- */
+
+/*
+ * 解析 `uci show <pkg>` 的输出，例：
+ *   firewall.@zone[2]=zone
+ *   firewall.@zone[2].name='singbox'
+ *   firewall.@zone[2].device='tun0'
+ *   firewall.@forwarding[1].src='lan'
+ *   firewall.@forwarding[1].dest='singbox'
+ *
+ * 返回 { '<section>': { '.type': 'zone', name: 'singbox', device: [ 'tun0' ] } }。
+ * add_list 造成的多值会收成数组；只有一个值时保持字符串，方便直接比较。
+ */
+function parseUciShow(text, pkg) {
+	var out = {};
+	var prefix = pkg ? (pkg + '.') : '';
+
+	String(text || '').split('\n').forEach(function(line) {
+		line = line.trim();
+
+		if (!line || line.indexOf(prefix) !== 0)
+			return;
+
+		var rest = line.slice(prefix.length);
+		var eq = rest.indexOf('=');
+
+		if (eq < 0)
+			return;
+
+		var left = rest.slice(0, eq);
+		var val = rest.slice(eq + 1).trim();
+
+		if (val.length >= 2 && val[0] === "'" && val[val.length - 1] === "'")
+			val = val.slice(1, -1);
+
+		/* firewall.@zone[2]=zone / firewall.cfgXXXX=zone —— 声明段类型 */
+		if (left.indexOf('.') < 0) {
+			out[left] = out[left] || {};
+			out[left]['.type'] = val;
+			return;
+		}
+
+		var dot = left.lastIndexOf('.');
+		var sec = left.slice(0, dot), opt = left.slice(dot + 1);
+
+		if (!out[sec])
+			out[sec] = {};
+
+		if (Object.prototype.hasOwnProperty.call(out[sec], opt))
+			out[sec][opt] = [].concat(out[sec][opt], val);
+		else
+			out[sec][opt] = val;
+	});
+
+	return out;
+}
+
+function uciListHas(value, item) {
+	if (value == null)
+		return false;
+
+	if (Array.isArray(value))
+		return value.indexOf(item) >= 0;
+
+	return String(value) === item;
+}
+
+function uciFindZone(sections, name) {
+	var keys = Object.keys(sections || {});
+
+	for (var i = 0; i < keys.length; i++) {
+		var s = sections[keys[i]];
+
+		if (s['.type'] === 'zone' && s.name === name)
+			return keys[i];
+	}
+
+	return null;
+}
+
+function uciFindForwarding(sections, src, dest) {
+	var keys = Object.keys(sections || {});
+
+	for (var i = 0; i < keys.length; i++) {
+		var s = sections[keys[i]];
+
+		if (s['.type'] === 'forwarding' && s.src === src && s.dest === dest)
+			return keys[i];
+	}
+
+	return null;
+}
+
+/*
+ * 检查 singbox 防火墙区是否配置正确。
+ * problems 里是问题代号，交给 fwProblemText() 转成人话。
+ *
+ * 为什么这些项都要满足：
+ *   - 区必须存在、且带 tun0 设备，否则 LAN 客户端的流量进不了 TUN
+ *     （fw4 的 forward 默认 DROP）；
+ *   - input 必须 ACCEPT，否则 tun0 的回程包被 reject，路由器自身经代理出站
+ *     直接报 "Operation not permitted"；
+ *   - masq 必须关闭，否则对 tun0 做 SNAT，sing-box 收不到真实源地址、回包错乱；
+ *   - lan->singbox 与 wan->singbox 两条转发都要有。
+ */
+function uciZoneStatus(sections) {
+	var problems = [];
+	var z = uciFindZone(sections, 'singbox');
+
+	if (!z)
+		return { ok: false, zone: null, problems: [ 'no-zone' ] };
+
+	var s = sections[z];
+
+	if (s.input !== 'ACCEPT') problems.push('input');
+	if (s.output !== 'ACCEPT') problems.push('output');
+	if (s.forward !== 'ACCEPT') problems.push('forward');
+	if (String(s.masq) === '1') problems.push('masq');
+	if (!uciListHas(s.device, 'tun0')) problems.push('device');
+	if (!uciFindForwarding(sections, 'lan', 'singbox')) problems.push('lan-forward');
+	if (!uciFindForwarding(sections, 'wan', 'singbox')) problems.push('wan-forward');
+
+	return { ok: (problems.length === 0), zone: z, problems: problems };
+}
+
+var FW_PROBLEM_TEXT = {
+	'no-zone': '缺少 singbox 防火墙区',
+	'input': 'input 不是 ACCEPT（会拒掉 tun0 回程包）',
+	'output': 'output 不是 ACCEPT',
+	'forward': 'forward 不是 ACCEPT',
+	'masq': 'masq 未关闭（会对 tun0 做 SNAT）',
+	'device': '未把 tun0 加入该区',
+	'lan-forward': '缺少 lan→singbox 转发',
+	'wan-forward': '缺少 wan→singbox 转发'
+};
+
+function fwProblemText(problems) {
+	return (problems || []).map(function(p) {
+		return FW_PROBLEM_TEXT[p] || p;
+	}).join('；');
+}
+
+/*
+ * 判断一个 DNS 上游是不是"内网地址"。
+ *
+ * 这是"国外域名被投毒"的判定关键：上游若在 WAN 子网（比如上游路由器
+ * 192.168.18.1），dnsmasq 查它的流量会命中 route 规则 ip_is_private→direct
+ * 直接出 WAN、**绕过 TUN**，sing-box 的 hijack-dns 抓不到，
+ * 国外域名就会拿到 GFW 投毒 IP。上游必须是公网地址，查询才会进 TUN 被接管。
+ */
+function isPrivateIp(s) {
+	var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(s || '').trim());
+
+	if (!m)
+		return true;
+
+	var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+
+	if (a === 0 || a === 10 || a === 127)
+		return true;
+
+	if (a === 192 && b === 168)
+		return true;
+
+	if (a === 172 && b >= 16 && b <= 31)
+		return true;
+
+	if (a === 169 && b === 254)
+		return true;
+
+	return false;
+}
+
 /*
  * 必须 return 一个 class：LuCI 的 require() 会 new 它再返回实例，
  * 直接 return 普通对象会报 "factory yields invalid constructor"。
@@ -1516,5 +1689,12 @@ return baseclass.extend({
 	shortIdOk: shortIdOk,
 	explainCheckError: explainCheckError,
 	scanPlaceholders: scanPlaceholders,
-	placeholderText: placeholderText
+	placeholderText: placeholderText,
+	parseUciShow: parseUciShow,
+	uciListHas: uciListHas,
+	uciFindZone: uciFindZone,
+	uciFindForwarding: uciFindForwarding,
+	uciZoneStatus: uciZoneStatus,
+	fwProblemText: fwProblemText,
+	isPrivateIp: isPrivateIp
 });

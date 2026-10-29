@@ -50,8 +50,12 @@ uci commit firewall
 #   改成公网解析器后：查询走 TUN → 被 hijack-dns 接管 → sing-box 按自己的规则
 #   分流（国内→dns_cn 直连、国外→DoH 1.1.1.1 走代理）→ 拿到真实 IP。
 #   注意：这里不接管 53 端口，本机 dnsmasq 继续监听 :53 负责给 LAN 客户端回包。
+uci set dhcp.@dnsmasq[0].port='53'
+# 旧版本 singbox-on 给 LAN 下发过强制 DNS，这里清掉
+uci -q delete dhcp.lan.dhcp_option 2>/dev/null || true
 uci set dhcp.@dnsmasq[0].noresolv='1'
-uci -q delete dhcp.@dnsmasq[0].server
+# uci -q delete 对"不存在的选项"返回 1；这里没有 set -e，但统一 || true 免得刷错误
+uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null || true
 uci add_list dhcp.@dnsmasq[0].server='223.5.5.5'
 uci add_list dhcp.@dnsmasq[0].server='119.29.29.29'
 uci commit dhcp

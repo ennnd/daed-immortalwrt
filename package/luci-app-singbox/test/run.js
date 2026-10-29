@@ -314,6 +314,82 @@ ok('导入后订阅节点还在', importCfg.outbounds.some(o => o.tag === 'Hy2')
 ok('导入后没有空组', importCfg.outbounds.filter(o => o.type === 'selector' || o.type === 'urltest')
 	.every(o => o.outbounds.length > 0));
 
+/* ---------- 5b. uci show 解析 / 防火墙区检查 / DNS 上游判定 ---------- */
+
+/*
+ * 这组是"开了 sing-box 国外全挂"那类故障的回归测试：
+ * 面板与命令行都要靠这几个纯函数判断防火墙区和 DNS 上游是否正确。
+ */
+
+const FW_DUMP = [
+	"firewall.@zone[0]=zone",
+	"firewall.@zone[0].name='lan'",
+	"firewall.@zone[0].network='lan'",
+	"firewall.@zone[1]=zone",
+	"firewall.@zone[1].name='wan'",
+	"firewall.@zone[1].network='wan'",
+	"firewall.@zone[2]=zone",
+	"firewall.@zone[2].name='singbox'",
+	"firewall.@zone[2].input='REJECT'",
+	"firewall.@zone[2].output='ACCEPT'",
+	"firewall.@zone[2].forward='DROP'",
+	"firewall.@zone[2].masq='0'",
+	"firewall.@zone[2].device='tun0'",
+	"firewall.@forwarding[0]=forwarding",
+	"firewall.@forwarding[0].src='lan'",
+	"firewall.@forwarding[0].dest='wan'",
+	"firewall.@forwarding[1]=forwarding",
+	"firewall.@forwarding[1].src='lan'",
+	"firewall.@forwarding[1].dest='singbox'"
+].join('\n');
+
+const fw = core.parseUciShow(FW_DUMP, 'firewall');
+
+ok('parseUciShow 认出 singbox 区', core.uciFindZone(fw, 'singbox') === '@zone[2]', core.uciFindZone(fw, 'singbox'));
+ok('parseUciShow 认出 lan->singbox 转发', core.uciFindForwarding(fw, 'lan', 'singbox') === '@forwarding[1]');
+ok('parseUciShow 认出 wan->singbox 转发缺失', core.uciFindForwarding(fw, 'wan', 'singbox') === null);
+ok('uciListHas 认单值', core.uciListHas(fw['@zone[2]'].device, 'tun0') === true);
+ok('uciListHas 认多值', core.uciListHas([ 'tun0', 'utun' ], 'tun0') === true);
+ok('uciListHas 拒错值', core.uciListHas(fw['@zone[2]'].device, 'wan') === false);
+
+const zs = core.uciZoneStatus(fw);
+ok('uciZoneStatus 认出 input=REJECT', zs.ok === false && zs.problems.indexOf('input') >= 0, JSON.stringify(zs.problems));
+ok('uciZoneStatus 认出 forward=DROP', zs.problems.indexOf('forward') >= 0, JSON.stringify(zs.problems));
+ok('uciZoneStatus 认出缺 wan->singbox 转发', zs.problems.indexOf('wan-forward') >= 0, JSON.stringify(zs.problems));
+ok('uciZoneStatus 不误报 masq=0', zs.problems.indexOf('masq') < 0, JSON.stringify(zs.problems));
+ok('fwProblemText 出中文说明', /ACCEPT/.test(core.fwProblemText(zs.problems)));
+
+const fwGood = core.parseUciShow([
+	"firewall.cfg0001=zone",
+	"firewall.cfg0001.name='singbox'",
+	"firewall.cfg0001.input='ACCEPT'",
+	"firewall.cfg0001.output='ACCEPT'",
+	"firewall.cfg0001.forward='ACCEPT'",
+	"firewall.cfg0001.masq='0'",
+	"firewall.cfg0001.device='tun0'",
+	"firewall.cfg0002=forwarding",
+	"firewall.cfg0002.src='lan'",
+	"firewall.cfg0002.dest='singbox'",
+	"firewall.cfg0003=forwarding",
+	"firewall.cfg0003.src='wan'",
+	"firewall.cfg0003.dest='singbox'"
+].join('\n'), 'firewall');
+
+ok('uciFindZone 支持命名段(cfgXXXX)', core.uciFindZone(fwGood, 'singbox') === 'cfg0001');
+ok('uciZoneStatus 全对时 ok', core.uciZoneStatus(fwGood).ok === true, JSON.stringify(core.uciZoneStatus(fwGood).problems));
+ok('parseUciShow 多值选项收成数组',
+	Array.isArray(core.parseUciShow("firewall.@zone[2].device='tun0'\nfirewall.@zone[2].device='utun'", 'firewall')['@zone[2]'].device));
+ok('parseUciShow 忽略别的包', core.parseUciShow("dhcp.lan.proto='static'", 'firewall').lan === undefined);
+
+/* DNS 上游判定：内网地址会绕过 TUN → 国外域名被投毒 */
+ok('isPrivateIp 192.168.18.1 是内网', core.isPrivateIp('192.168.18.1') === true);
+ok('isPrivateIp 10.x 是内网', core.isPrivateIp('10.0.0.1') === true);
+ok('isPrivateIp 172.16-31 是内网', core.isPrivateIp('172.20.0.1') === true);
+ok('isPrivateIp 169.254 是内网', core.isPrivateIp('169.254.1.1') === true);
+ok('isPrivateIp 223.5.5.5 是公网', core.isPrivateIp('223.5.5.5') === false);
+ok('isPrivateIp 119.29.29.29 是公网', core.isPrivateIp('119.29.29.29') === false);
+ok('isPrivateIp 域名保守当作会绕过', core.isPrivateIp('dns.example.com') === true);
+
 /* ---------- 6. 产出样例配置给 sing-box check 用 ---------- */
 
 const samplePath = process.env.SINGBOX_SAMPLE || path.join(require('os').tmpdir(), 'luci-singbox-sample.json');

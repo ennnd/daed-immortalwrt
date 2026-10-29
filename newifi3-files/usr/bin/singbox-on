@@ -62,8 +62,13 @@ ensure_singbox_fw
 # ★ dnsmasq 上游 DNS 改成公网解析器（见 99-singbox 里同一段注释的完整说明）。
 #   不改的话 dnsmasq 问上游路由器(192.168.18.1)的流量会绕过 TUN，
 #   sing-box 的 hijack-dns 抓不到 → 国外域名拿到投毒 IP → 国外全挂。
+uci set dhcp.@dnsmasq[0].port='53'
+# 旧版本 singbox-on 给 LAN 下发过强制 DNS，这里清掉
+uci -q delete dhcp.lan.dhcp_option 2>/dev/null || true
 uci set dhcp.@dnsmasq[0].noresolv='1'
-uci -q delete dhcp.@dnsmasq[0].server
+# uci -q delete 对"不存在的选项"返回 1，配合 set -e 会让脚本在这里直接退出，
+# 所以必须 || true 兜住（全新设备上本来就没有 server 选项）。
+uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null || true
 uci add_list dhcp.@dnsmasq[0].server='223.5.5.5'
 uci add_list dhcp.@dnsmasq[0].server='119.29.29.29'
 uci commit dhcp

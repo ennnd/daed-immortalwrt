@@ -9,8 +9,9 @@ uci set sing-box.main.enabled='0'
 uci commit sing-box
 
 uci set dhcp.@dnsmasq[0].port='53'
-# singbox-on 把 LAN 的 DNS 改成了 223.5.5.5；这里删掉，恢复默认（用路由器做 DNS）
-uci -q delete dhcp.lan.dhcp_option
+# 旧版本 singbox-on 会加过 LAN 的强制 DNS；这里清掉。
+# uci -q delete 对不存在的选项返回 1，配合 set -e 会让脚本提前退出，必须 || true。
+uci -q delete dhcp.lan.dhcp_option 2>/dev/null || true
 uci commit dhcp
 /etc/init.d/dnsmasq restart
 

@@ -119,8 +119,26 @@ const fakeFs = {
 		}
 
 		if (/uci$/.test(cmd)) {
-			/* 简单模拟 uci set X=Y / commit，方便测 ensureConffile */
-			if (a[0] === 'set') {
+			const a0 = a[0] || '';
+
+			/* uci show <pkg>：从 uciData 渲染出真实格式 */
+			if (a0 === 'show') {
+				return Promise.resolve({ code: 0, stdout: renderUciShow(a[1]), stderr: '' });
+			}
+
+			/* uci add firewall zone|forwarding：新建段并返回段名 */
+			if (a0 === 'add' && a[1] === 'firewall') {
+				const name = 'cfg' + String(++addedCounter).padStart(4, '0');
+
+				if (!uciData.firewall)
+					uciData.firewall = {};
+
+				uciData.firewall[name] = { '.type': a[2] === 'zone' ? 'zone' : 'forwarding' };
+
+				return Promise.resolve({ code: 0, stdout: name + '\n', stderr: '' });
+			}
+
+			if (a0 === 'set' || a0 === 'add_list') {
 				const m = /^(.+?)\.(.+?)\.(.+?)=(.+)$/.exec(a[1] || '');
 
 				if (m) {
@@ -131,7 +149,13 @@ const fakeFs = {
 					if (!uciData[pkg][sid])
 						uciData[pkg][sid] = {};
 
-					uciData[pkg][sid][opt] = val;
+					if (a0 === 'add_list') {
+						const cur = uciData[pkg][sid][opt];
+
+						uciData[pkg][sid][opt] = cur == null ? [ val ] : [].concat(cur, val);
+					}
+					else
+						uciData[pkg][sid][opt] = val;
 				}
 			}
 
@@ -155,8 +179,53 @@ const uciData = {
 	dhcp: {
 		'@dnsmasq[0]': { '.type': 'dnsmasq', port: '0' },
 		lan: { '.type': 'interface', dhcp_option: [ '6,223.5.5.5' ] }
+	},
+	/*
+	 * 防火墙布局刻意做成"修复前"的样子：singbox 区 input=REJECT / forward=DROP，
+	 * 且缺 wan->singbox 转发 —— 正是实机上让代理回程被拒、路由器自身出站报
+	 * "Operation not permitted" 的那套配置。enable() 必须把它修好。
+	 */
+	firewall: {
+		'@zone[0]': { '.type': 'zone', name: 'lan', network: 'lan' },
+		'@zone[1]': { '.type': 'zone', name: 'wan', network: 'wan' },
+		'@zone[2]': { '.type': 'zone', name: 'singbox', input: 'REJECT', output: 'ACCEPT', forward: 'DROP', masq: '0', device: 'tun0' },
+		'@forwarding[0]': { '.type': 'forwarding', src: 'lan', dest: 'wan' },
+		'@forwarding[1]': { '.type': 'forwarding', src: 'lan', dest: 'singbox' }
 	}
 };
+
+let addedCounter = 0;
+
+/* 把 uciData 渲染成 `uci show <pkg>` 的真实格式 */
+function renderUciShow(pkg) {
+	const data = uciData[pkg];
+
+	if (!data)
+		return '';
+
+	const lines = [];
+
+	for (const sid in data) {
+		const sec = data[sid];
+
+		if (sec['.type'])
+			lines.push(pkg + '.' + sid + '=' + sec['.type']);
+
+		for (const opt in sec) {
+			if (opt === '.type')
+				continue;
+
+			const v = sec[opt];
+
+			if (Array.isArray(v))
+				v.forEach(x => lines.push(pkg + '.' + sid + '.' + opt + "='" + x + "'"));
+			else
+				lines.push(pkg + '.' + sid + '.' + opt + "='" + v + "'");
+		}
+	}
+
+	return lines.join('\n') + '\n';
+}
 
 const fakeUci = {
 	load: p => Promise.resolve(),
@@ -292,14 +361,60 @@ function load(name) {
 		.split('YOUR_SNI').join('www.bing.com')
 		.split('YOUR_PASSWORD').join('pw');
 
+	/* 只看 enable() 之后产生的调用（之前 saveConfig 也会重启 sing-box） */
+	const mark = calls.length;
 	const en = await api.enable();
 	check('enable 成功', en.running === true);
-	check('enable 改了 dnsmasq port=0',
-		calls.some(c => c[0] === 'exec' && /uci$/.test(c[1]) && (c[2] || '') === 'set' && (c[3] || '').indexOf('dnsmasq[0].port=0') > 0));
-	check('enable 写了 dhcp_option',
-		calls.some(c => c[0] === 'exec' && (c[2] || '') === 'add_list'));
+
+	const enCalls = calls.slice(mark);
+
+	/* 找出某条 uci 调用：uciCall('set', 'xxx') */
+	const uciCall = (verb, needle) => enCalls.some(c =>
+		c[0] === 'exec' && /uci$/.test(c[1]) && (c[2] || '') === verb &&
+		String(c[3] || '').indexOf(needle) >= 0);
+
+	/* --- DNS：绝不能再做"DNS 接管"，必须换公网上游 --- */
+	check('enable 没有把 dnsmasq port 设成 0（旧版接管会打死整网 DNS）',
+		!uciCall('set', 'dnsmasq[0].port=0'));
+	check('enable 没有给 LAN 下发强制 DNS',
+		!uciCall('add_list', 'dhcp.lan.dhcp_option'));
+	check('enable 清掉了旧版留下的 LAN 强制 DNS',
+		enCalls.some(c => c[0] === 'exec' && /uci$/.test(c[1]) &&
+			c.slice(2).indexOf('dhcp.lan.dhcp_option') >= 0));
+	check('enable 把 dnsmasq port 复位成 53', uciCall('set', 'dhcp.@dnsmasq[0].port=53'));
+	check('enable 设置了 noresolv=1', uciCall('set', 'dhcp.@dnsmasq[0].noresolv=1'));
+	check('enable 把上游换成公网解析器 223.5.5.5',
+		uciCall('add_list', 'dhcp.@dnsmasq[0].server=223.5.5.5'));
+	check('enable 把上游换成公网解析器 119.29.29.29',
+		uciCall('add_list', 'dhcp.@dnsmasq[0].server=119.29.29.29'));
+
+	/* --- 防火墙区：必须建好并放行 tun0 回程 --- */
+	check('enable 把 singbox 区 input 改成 ACCEPT', uciCall('set', 'firewall.@zone[2].input=ACCEPT'));
+	check('enable 把 singbox 区 forward 改成 ACCEPT', uciCall('set', 'firewall.@zone[2].forward=ACCEPT'));
+	check('enable 关闭 singbox 区 masquerade', uciCall('set', 'firewall.@zone[2].masq=0'));
+	check('enable 补上了缺失的 wan->singbox 转发',
+		enCalls.some(c => c[0] === 'exec' && (c[2] || '') === 'add' &&
+			(c[3] || '') === 'firewall' && (c[4] || '') === 'forwarding'));
+	check('enable 调用了 fw4 reload 让规则生效',
+		enCalls.some(c => c[0] === 'exec' && /fw4$/.test(c[1]) && (c[2] || '') === 'reload'));
+
+	/* --- 顺序：fw4 reload 必须早于 sing-box restart，否则 TUN 规则被冲掉 --- */
+	const idxFw4 = enCalls.findIndex(c => c[0] === 'exec' && /fw4$/.test(c[1]));
+	const idxRestart = enCalls.findIndex(c => c[0] === 'exec' &&
+		c[1] === '/etc/init.d/sing-box' && (c[2] || '') === 'restart');
+	check('enable 顺序正确：fw4 reload 在 sing-box restart 之前',
+		idxFw4 >= 0 && idxRestart >= 0 && idxFw4 < idxRestart,
+		'fw4=' + idxFw4 + ' restart=' + idxRestart);
+
 	check('enable 前确保 conffile 已设置（救回缺 conffile 的固件）',
 		uciData['sing-box']['main']['conffile'] === '/etc/sing-box/config.json');
+
+	/* --- enable 之后状态自检 --- */
+	const st2 = await api.status();
+	check('enable 后防火墙区判定为正常', st2.fw_zone_ok === true, JSON.stringify(st2.fw_zone_problems));
+	check('enable 后 DNS 判定为经 sing-box', st2.dns_via_singbox === true,
+		JSON.stringify({ noresolv: st2.dns_noresolv, upstream: st2.dns_upstream }));
+	check('enable 后不再判定为旧版接管', st2.dns_taken === false);
 
 	const dis = await api.disable();
 	check('disable 成功', dis.running === false);

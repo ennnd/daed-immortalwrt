@@ -133,12 +133,19 @@ return view.extend({
 				? st.tun.join(', ')
 				: _('未发现（服务未运行，或 TUN 入站被关掉）')),
 			sbui.kvRow(_('UCI enabled'), st.uci_enabled ? '1' : '0'),
-			sbui.kvRow(_('DNS 接管'), [
-				st.dns_taken ? sbui.badge(_('已接管'), 'ok') : sbui.badge(_('未接管'), 'warn'),
+			sbui.kvRow(_('DNS 路径'), [
+				st.dns_via_singbox
+					? sbui.badge(_('经 sing-box（国外走 DoH 代理）'), 'ok')
+					: sbui.badge(_('直连解析器'), 'warn'),
 				' ',
 				E('span', { 'style': 'opacity:.75' },
-					'(' + _('dnsmasq port') + ': ' + (st.dnsmasq_port == null ? '—' : String(st.dnsmasq_port)) + ')')
+					'(' + _('上游') + ': ' + (st.dns_upstream && st.dns_upstream.length
+						? st.dns_upstream.join(', ')
+						: _('默认（resolv.conf）')) + ')')
 			]),
+			sbui.kvRow(_('防火墙区'), st.fw_zone_ok
+				? sbui.badge(_('正常'), 'ok')
+				: sbui.badge(_('未正确配置'), 'bad')),
 			sbui.kvRow(_('urltest 最近选择'), st.urltest_last || '—',
 				'font-family:monospace;font-size:11px;word-break:break-all')
 		];
@@ -146,14 +153,14 @@ return view.extend({
 		var actions = [
 			sbui.btn(_('启用'), 'cbi-button-apply', sbui.action(function() {
 				return api.enable().then(function() {
-					sbui.notifyOk(_('已启用：sing-box 运行中，dnsmasq 只做 DHCP，LAN DNS 指向 223.5.5.5'));
+					sbui.notifyOk(_('已启用：sing-box 运行中，防火墙区与 DNS 上游已就绪'));
 					return self.reload();
 				});
 			})),
 			' ',
 			sbui.btn(_('停用'), 'cbi-button-reset', sbui.action(function() {
 				return api.disable().then(function() {
-					sbui.notifyOk(_('已停用：服务已停止，dnsmasq 已恢复监听 53'));
+					sbui.notifyOk(_('已停用：服务已停止，DNS 保持直连解析器'));
 					return self.reload();
 				});
 			})),
@@ -177,8 +184,28 @@ return view.extend({
 		var children = [
 			sbui.kvTable(rows),
 			E('div', { 'style': 'margin-top:1em' }, actions),
-			sbui.hint(_('启用会复用 singbox-on 的逻辑：先确认 sing-box 起来了，再让 dnsmasq 交出 DNS（port=0，LAN 走 223.5.5.5）。启动失败自动回滚，dnsmasq 不会被改。'))
+			sbui.hint(_('启用会先建好 singbox 防火墙区（放行 tun0 回程、加上 lan/wan→singbox 转发），' +
+				'再把 dnsmasq 的上游 DNS 指向公网解析器，最后才启动 sing-box。' +
+				'顺序很重要：防火墙必须早于 sing-box（fw4 reload 会冲掉 TUN 规则）。启动失败会自动回滚。'))
 		];
+
+		if (st.dns_taken) {
+			children.unshift(sbui.warn(
+				_('检测到旧版遗留的 DNS 接管（dnsmasq port=0 + LAN 强制 DNS）。' +
+				'这种状态下 sing-box 并不监听 :53，会导致整网无法解析。点「启用」可自动修复。')));
+		}
+
+		if (st.dns_upstream_private) {
+			children.unshift(sbui.warn(
+				_('dnsmasq 的上游 DNS 是内网地址，查询会绕过 TUN，' +
+				'国外域名可能被投毒而打不开。点「启用」可自动改成公网解析器。')));
+		}
+
+		if (!st.fw_zone_ok) {
+			children.unshift(sbui.warn(
+				_('singbox 防火墙区未正确配置：') + core.fwProblemText(st.fw_zone_problems) +
+				_('。这会导致 LAN 客户端上不了网或代理回程被拒。点「启用」可自动修复。')));
+		}
 
 		if (this.placeholders.length) {
 			children.unshift(sbui.warn(

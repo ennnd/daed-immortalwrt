@@ -19,6 +19,13 @@ var BAK_DIR = '/etc/sing-box/backup';
 var ROM_CFG = '/rom/etc/sing-box/config.json';
 var SUB_TMP = '/tmp/luci-singbox-sub.txt';
 
+/*
+ * dnsmasq 的上游 DNS 必须是**公网**地址，见 core.isPrivateIp() 的说明：
+ * 上游若在 WAN 子网，查询会绕过 TUN，sing-box 的 hijack-dns 抓不到，
+ * 国外域名就会拿到 GFW 投毒 IP（表现为"开了 sing-box 国外全挂"）。
+ */
+var DNS_UPSTREAM = [ '223.5.5.5', '119.29.29.29' ];
+
 /* rpcd 的 file read 上限是 256KB（RPC_FILE_MAX_SIZE），留点余量 */
 var MAX_SUB = 200 * 1024;
 var MAX_BAK = 5;
@@ -98,6 +105,31 @@ api.uciGet = function(pkg, sid, opt) {
 	}).catch(function() {
 		return null;
 	});
+};
+
+/* `uci show <pkg>` 的原始输出（供 core.parseUciShow 解析） */
+api.uciShow = function(pkg) {
+	return api.uci([ 'show', pkg ]).then(function(res) {
+		return (res.code === 0) ? (res.stdout || '') : '';
+	});
+};
+
+/*
+ * 依次执行一组 uci 命令。
+ * 单条失败不中断：`uci -q delete <不存在的选项>` 返回 1（不是 0），
+ * 如果把它当致命错误，会在"全新设备本来就没有该选项"时把流程打断。
+ */
+api.uciSeq = function(list) {
+	var self = this;
+
+	function step(i) {
+		if (i >= list.length)
+			return Promise.resolve();
+
+		return self.uci(list[i]).then(function() { return step(i + 1); });
+	}
+
+	return step(0);
 };
 
 /* ---------------- 配置文件 ---------------- */
@@ -350,10 +382,29 @@ api.status = function() {
 		api.logTail(40),
 		api.uciGet('dhcp', '@dnsmasq[0]', 'port'),
 		api.uciGet('dhcp', 'lan', 'dhcp_option'),
-		api.uciGet('sing-box', 'main', 'enabled')
+		api.uciGet('sing-box', 'main', 'enabled'),
+		api.uciGet('dhcp', '@dnsmasq[0]', 'noresolv'),
+		api.uciGet('dhcp', '@dnsmasq[0]', 'server'),
+		api.uciShow('firewall')
 	]).then(function(r) {
 		var opts = Array.isArray(r[5]) ? r[5] : (r[5] ? [ r[5] ] : []);
-		var dnsTaken = (String(r[4]) === '0' && opts.indexOf('6,223.5.5.5') >= 0);
+		var upstream = Array.isArray(r[8]) ? r[8] : (r[8] ? [ r[8] ] : []);
+		var noresolv = (String(r[7]) === '1');
+
+		/* 旧版"DNS 接管"留下的残留：port=0 + LAN 下发 6,223.5.5.5。
+		   这种状态下 :53 无人监听 → 整网解析瘫痪，必须提示用户。 */
+		var legacyTakeover = (String(r[4]) === '0' && opts.indexOf('6,223.5.5.5') >= 0);
+
+		/* 查询会不会被 sing-box 的 hijack-dns 接管：
+		   上游是公网地址 → 查询走 TUN → 被接管 → 国外域名由 DoH 经代理解析。
+		   上游是内网地址（上游路由器）→ 绕过 TUN → 国外域名会被投毒。 */
+		var publicUpstream = upstream.length > 0 && upstream.every(function(s) {
+			return !core.isPrivateIp(s);
+		});
+		var viaSingbox = noresolv && publicUpstream;
+
+		var fsecs = core.parseUciShow(r[9], 'firewall');
+		var fz = core.uciZoneStatus(fsecs);
 
 		var selected = '';
 
@@ -369,7 +420,13 @@ api.status = function() {
 			tun: r[2],
 			log: r[3],
 			dnsmasq_port: r[4],
-			dns_taken: dnsTaken,
+			dns_taken: legacyTakeover,
+			dns_noresolv: noresolv,
+			dns_upstream: upstream,
+			dns_via_singbox: viaSingbox,
+			dns_upstream_private: (upstream.length > 0 && !publicUpstream),
+			fw_zone_ok: fz.ok,
+			fw_zone_problems: fz.problems,
 			uci_enabled: String(r[6]) === '1',
 			urltest_last: selected
 		};
@@ -391,7 +448,140 @@ api.ensureConffile = function() {
 	});
 };
 
-/* 启用：完全按 /usr/bin/singbox-on 的顺序，失败回滚，绝不先动 dnsmasq */
+/* ---------------- 环境准备：防火墙区 + DNS 上游 ---------------- */
+
+/*
+ * 确保 singbox 防火墙区存在且策略正确。
+ *
+ * 与 /usr/bin/singbox-on 里的 ensure_singbox_fw 一一对应
+ * （**改一处必须改两处**，否则面板和命令行行为会漂移——这个坑踩过两次）。
+ *
+ * 为什么必须有：
+ *   - TUN 设备 tun0 若不在任何区里，fw4 的 forward 默认 DROP，
+ *     LAN 客户端的流量进不了 tun0（路由器自己能上、客户端全都上不了）；
+ *   - 区策略若是 input=REJECT，tun0 的回程包会被 reject，
+ *     路由器自身经代理出站直接报 "Operation not permitted"。
+ */
+api.ensureFirewallZone = function() {
+	var self = this;
+
+	return self.uciShow('firewall').then(function(text) {
+		var secs = core.parseUciShow(text, 'firewall');
+		var z = core.uciFindZone(secs, 'singbox');
+
+		if (!z) {
+			return self.uci([ 'add', 'firewall', 'zone' ]).then(function(res) {
+				z = String(res.stdout || '').trim();
+
+				if (!z)
+					throw new Error(_('创建 singbox 防火墙区失败'));
+
+				return self.uci([ 'set', 'firewall.' + z + '.name=singbox' ]).then(function() {
+					return self.finishFirewallZone(secs, z);
+				});
+			});
+		}
+
+		return self.finishFirewallZone(secs, z);
+	});
+};
+
+api.finishFirewallZone = function(secs, z) {
+	var self = this;
+	var cmds = [
+		[ 'set', 'firewall.' + z + '.input=ACCEPT' ],
+		[ 'set', 'firewall.' + z + '.output=ACCEPT' ],
+		[ 'set', 'firewall.' + z + '.forward=ACCEPT' ],
+		[ 'set', 'firewall.' + z + '.masq=0' ]
+	];
+
+	if (!core.uciListHas((secs[z] || {})['device'], 'tun0'))
+		cmds.push([ 'add_list', 'firewall.' + z + '.device=tun0' ]);
+
+	return self.uciSeq(cmds).then(function() {
+		return self.uci([ 'commit', 'firewall' ]);
+	}).then(function() {
+		/* 缺哪条转发就补哪条：lan->singbox 给 LAN 客户端，wan->singbox 给路由器自身 */
+		var need = [];
+
+		if (!core.uciFindForwarding(secs, 'lan', 'singbox'))
+			need.push([ 'lan', 'singbox' ]);
+
+		if (!core.uciFindForwarding(secs, 'wan', 'singbox'))
+			need.push([ 'wan', 'singbox' ]);
+
+		function addNext(i) {
+			if (i >= need.length)
+				return Promise.resolve();
+
+			return self.addForwarding(need[i][0], need[i][1]).then(function() {
+				return addNext(i + 1);
+			});
+		}
+
+		return addNext(0);
+	}).then(function() {
+		/* 规则要生效：fw4 reload；fw4 不可用就退回重启 firewall 服务 */
+		return self.execAny([ '/usr/sbin/fw4', '/sbin/fw4', '/bin/fw4' ], [ 'reload' ]).then(function(res) {
+			if (res.code === 0)
+				return res;
+
+			return self.exec('/etc/init.d/firewall', [ 'restart' ]);
+		});
+	});
+};
+
+api.addForwarding = function(src, dest) {
+	var self = this;
+
+	return self.uci([ 'add', 'firewall', 'forwarding' ]).then(function(res) {
+		var s = String(res.stdout || '').trim();
+
+		if (!s)
+			throw new Error(_('创建防火墙转发规则失败'));
+
+		return self.uci([ 'set', 'firewall.' + s + '.src=' + src ])
+			.then(function() { return self.uci([ 'set', 'firewall.' + s + '.dest=' + dest ]); })
+			.then(function() { return self.uci([ 'commit', 'firewall' ]); });
+	});
+};
+
+/*
+ * 把 dnsmasq 的上游 DNS 改成公网解析器，并禁用读 resolv.conf。
+ *
+ * 这是"开了 sing-box 国外全挂"的真正根因（不是节点、不是 MTU、不是防火墙）：
+ * 上游路由器在 WAN 子网，dnsmasq 查它的流量命中 route 规则
+ * ip_is_private→direct 直接出 WAN、**绕过 TUN**，sing-box 的 hijack-dns
+ * 规则根本抓不到 → 国外域名拿到 GFW 投毒 IP → 连过去被上游回
+ * admin-prohibited（connect 报 EPERM / "Operation not permitted"）。
+ *
+ * 改成公网解析器后：查询走 TUN → 被 hijack-dns 接管 → sing-box 按自己的规则
+ * 分流（国内→dns_cn 直连、国外→DoH 1.1.1.1 走代理）→ 拿到真实 IP。
+ *
+ * 注意：**不能**用"dnsmasq port=0 + LAN 下发 6,223.5.5.5"那套接管做法——
+ * 本配置 sing-box 并不监听 :53，接管后 :53 无人监听，整网解析瘫痪。
+ */
+api.ensureDnsUpstream = function() {
+	var self = this;
+	var cmds = [
+		/* 修掉旧版"DNS 接管"留下的状态：dnsmasq port=0 会让 :53 无人监听，
+		   整网解析瘫痪；LAN 被下发 6,223.5.5.5 会让客户端绕过路由器解析。 */
+		[ 'set', 'dhcp.@dnsmasq[0].port=53' ],
+		[ '-q', 'delete', 'dhcp.lan.dhcp_option' ],
+		[ 'set', 'dhcp.@dnsmasq[0].noresolv=1' ],
+		[ '-q', 'delete', 'dhcp.@dnsmasq[0].server' ]
+	];
+
+	DNS_UPSTREAM.forEach(function(s) {
+		cmds.push([ 'add_list', 'dhcp.@dnsmasq[0].server=' + s ]);
+	});
+
+	return self.uciSeq(cmds)
+		.then(function() { return self.uci([ 'commit', 'dhcp' ]); })
+		.then(function() { return self.exec('/etc/init.d/dnsmasq', [ 'restart' ]); });
+};
+
+/* 启用：完全按 /usr/bin/singbox-on 的顺序，失败回滚 */
 api.enable = function() {
 	var self = api;
 	var cfgText = '';
@@ -415,6 +605,13 @@ api.enable = function() {
 		if (res.code !== 0)
 			throw self.checkFailure(cfgText, res);
 
+		/* 防火墙必须排在 sing-box 之前：fw4 reload 会把 TUN 规则冲掉，
+		   所以先 reload 防火墙、再启动 sing-box。 */
+		return self.ensureFirewallZone();
+	}).then(function() {
+		/* dnsmasq 上游改公网解析器（否则国外域名被投毒，见 ensureDnsUpstream 注释） */
+		return self.ensureDnsUpstream();
+	}).then(function() {
 		return self.uci([ 'set', 'sing-box.main.enabled=1' ]);
 	}).then(function() {
 		return self.uci([ 'commit', 'sing-box' ]);
@@ -440,25 +637,17 @@ api.enable = function() {
 		return poll();
 	}).then(function(st) {
 		if (!st.running) {
-			/* 回滚：把 enabled 关掉并停服务，dnsmasq 保持原样 */
+			/* 回滚：把 enabled 关掉并停服务 */
 			return self.uci([ 'set', 'sing-box.main.enabled=0' ])
 				.then(function() { return self.uci([ 'commit', 'sing-box' ]); })
 				.then(function() { return self.exec('/etc/init.d/sing-box', [ 'stop' ]); })
 				.then(function() { return self.logTail(20); })
 				.then(function(log) {
-					throw new Error(_('sing-box 启动失败，已回滚，dnsmasq 未改动') + '\n' + log);
+					throw new Error(_('sing-box 启动失败，已回滚') + '\n' + log);
 				});
 		}
 
-		/* 成功之后才接管 DNS：dnsmasq 只做 DHCP，LAN DNS 指向 223.5.5.5 */
-		return self.uci([ 'set', 'dhcp.@dnsmasq[0].port=0' ])
-			.then(function() { return self.uci([ '-q', 'delete', 'dhcp.lan.dhcp_option' ]); })
-			.then(function() { return self.uci([ 'add_list', 'dhcp.lan.dhcp_option=6,223.5.5.5' ]); })
-			.then(function() { return self.uci([ 'commit', 'dhcp' ]); })
-			.then(function() { return self.exec('/etc/init.d/dnsmasq', [ 'restart' ]); })
-			.then(function() {
-				return { running: true, pid: st.pid };
-			});
+		return { running: true, pid: st.pid };
 	});
 };
 
@@ -468,6 +657,9 @@ api.disable = function() {
 	return self.exec('/etc/init.d/sing-box', [ 'stop' ])
 		.then(function() { return self.uci([ 'set', 'sing-box.main.enabled=0' ]); })
 		.then(function() { return self.uci([ 'commit', 'sing-box' ]); })
+		/* 清掉旧版本（DNS 接管版）可能留下的残留状态。
+		   dnsmasq 的上游保持公网解析器：这样即便 sing-box 停着，
+		   DNS 也不会再被上游路由器的投毒答案带偏。 */
 		.then(function() { return self.uci([ 'set', 'dhcp.@dnsmasq[0].port=53' ]); })
 		.then(function() { return self.uci([ '-q', 'delete', 'dhcp.lan.dhcp_option' ]); })
 		.then(function() { return self.uci([ 'commit', 'dhcp' ]); })
