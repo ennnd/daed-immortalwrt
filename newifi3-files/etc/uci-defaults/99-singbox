@@ -39,6 +39,25 @@ if [ -z "$f" ]; then
 fi
 uci commit firewall
 
+# ★ 阻断 LAN -> WAN 的 IPv6（防 IPv6 绕过代理泄漏真实 IP）
+#   本配置的 TUN 只有 IPv4 地址(172.19.0.1/30)，sing-box 不处理 IPv6，
+#   而运营商 /64 前缀会经 RA/SLAAC 直接下发给 LAN 客户端全局 IPv6。
+#   客户端 IPv6 流量会走 lan->wan 直接出 WAN，绕过 TUN 和代理，
+#   网站看到的就是客户端真实的运营商 IPv6。
+#   节点侧本来也没有 IPv6 出口，代理也承载不了这条路径，
+#   所以直接 REJECT 掉 LAN 的 IPv6 出网（客户端会快速回退 IPv4）。
+r=$(uci -q show firewall | sed -n "s/^firewall\.\(@rule\[[0-9]*\]\|cfg[0-9a-fA-F]*\)\.name='Block-LAN-IPv6-Egress'$/\1/p" | head -1)
+if [ -z "$r" ]; then
+  r=$(uci add firewall rule)
+  uci set firewall.$r.name='Block-LAN-IPv6-Egress'
+fi
+uci set firewall.$r.src='lan'
+uci set firewall.$r.dest='wan'
+uci set firewall.$r.family='ipv6'
+uci set firewall.$r.proto='all'
+uci set firewall.$r.target='REJECT'
+uci commit firewall
+
 # ★ 把 dnsmasq 的上游 DNS 指向公网解析器（并禁用读 resolv.conf）。
 #   这是"国外站点全打不开"的真正根因，不改这里 sing-box 装得再对也没用：
 #   上游路由器(192.168.18.1)位于 WAN 子网，dnsmasq 查询它的流量会命中

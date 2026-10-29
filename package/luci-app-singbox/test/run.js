@@ -381,6 +381,44 @@ ok('parseUciShow 多值选项收成数组',
 	Array.isArray(core.parseUciShow("firewall.@zone[2].device='tun0'\nfirewall.@zone[2].device='utun'", 'firewall')['@zone[2]'].device));
 ok('parseUciShow 忽略别的包', core.parseUciShow("dhcp.lan.proto='static'", 'firewall').lan === undefined);
 
+/* IPv6 绕过防护：TUN 只有 IPv4，LAN 的 IPv6 若放行出 WAN 就绕过代理泄漏真实 IP */
+const v6Missing = core.parseUciShow([
+	"firewall.@zone[2]=zone",
+	"firewall.@zone[2].name='singbox'"
+].join('\n'), 'firewall');
+
+ok('uciFindIpv6BlockRule 找不到时返回 null', core.uciFindIpv6BlockRule(v6Missing) === null);
+ok('uciIpv6BlockStatus 认出缺规则', core.uciIpv6BlockStatus(v6Missing).ok === false &&
+	core.uciIpv6BlockStatus(v6Missing).problems.indexOf('no-rule') >= 0);
+
+const v6Bad = core.parseUciShow([
+	"firewall.cfg9001=rule",
+	"firewall.cfg9001.name='Block-LAN-IPv6-Egress'",
+	"firewall.cfg9001.src='lan'",
+	"firewall.cfg9001.dest='wan'",
+	"firewall.cfg9001.family='ipv4'",
+	"firewall.cfg9001.proto='all'",
+	"firewall.cfg9001.target='DROP'"
+].join('\n'), 'firewall');
+
+const v6BadSt = core.uciIpv6BlockStatus(v6Bad);
+ok('uciFindIpv6BlockRule 按名字找到规则', core.uciFindIpv6BlockRule(v6Bad) === 'cfg9001');
+ok('uciIpv6BlockStatus 认出 family 不是 ipv6', v6BadSt.problems.indexOf('family') >= 0, JSON.stringify(v6BadSt.problems));
+ok('uciIpv6BlockStatus 认出 DROP（应用 REJECT 让客户端快速回退）', v6BadSt.problems.indexOf('drop') >= 0, JSON.stringify(v6BadSt.problems));
+
+const v6Good = core.parseUciShow([
+	"firewall.cfg9002=rule",
+	"firewall.cfg9002.name='Block-LAN-IPv6-Egress'",
+	"firewall.cfg9002.src='lan'",
+	"firewall.cfg9002.dest='wan'",
+	"firewall.cfg9002.family='ipv6'",
+	"firewall.cfg9002.proto='all'",
+	"firewall.cfg9002.target='REJECT'"
+].join('\n'), 'firewall');
+
+ok('uciIpv6BlockStatus 全对时 ok', core.uciIpv6BlockStatus(v6Good).ok === true, JSON.stringify(core.uciIpv6BlockStatus(v6Good).problems));
+ok('ipv6ProblemText 出中文说明', /IPv6/.test(core.ipv6ProblemText([ 'no-rule' ])));
+
 /* DNS 上游判定：内网地址会绕过 TUN → 国外域名被投毒 */
 ok('isPrivateIp 192.168.18.1 是内网', core.isPrivateIp('192.168.18.1') === true);
 ok('isPrivateIp 10.x 是内网', core.isPrivateIp('10.0.0.1') === true);

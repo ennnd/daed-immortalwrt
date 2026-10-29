@@ -1601,6 +1601,53 @@ function uciZoneStatus(sections) {
 	return { ok: (problems.length === 0), zone: z, problems: problems };
 }
 
+/*
+ * 找出阻断 LAN -> WAN IPv6 的规则段名。
+ *
+ * 为什么需要它：本配置的 TUN 只分配了 IPv4 地址，sing-box 完全不处理 IPv6；
+ * 而运营商 /64 前缀会经 RA/SLAAC 直接给 LAN 客户端全局 IPv6 地址，
+ * 客户端 IPv6 流量走 fw4 的 lan->wan 直接出 WAN，**绕过 TUN 和代理**，
+ * 网站看到的是客户端真实的运营商 IPv6 —— 代理等于白装。
+ * 节点侧本来也没有 IPv6 出口，所以最合理的做法是把 LAN 的 IPv6 出网 REJECT 掉。
+ */
+function uciFindIpv6BlockRule(sections) {
+	var keys = Object.keys(sections || {});
+
+	for (var i = 0; i < keys.length; i++) {
+		var s = sections[keys[i]];
+
+		if (s['.type'] === 'rule' && s.name === 'Block-LAN-IPv6-Egress')
+			return keys[i];
+	}
+
+	return null;
+}
+
+/*
+ * 检查 IPv6 绕过防护是否到位。
+ *   - 规则必须存在；
+ *   - family 必须是 ipv6（否则会连 IPv4 一起拦掉）；
+ *   - src 必须是 lan、dest 必须是 wan；
+ *   - target 用 REJECT 而不是 DROP：REJECT 会回 ICMPv6 unreachable，
+ *     客户端立刻回退 IPv4；DROP 则要干等连接超时。
+ */
+function uciIpv6BlockStatus(sections) {
+	var problems = [];
+	var r = uciFindIpv6BlockRule(sections);
+
+	if (!r)
+		return { ok: false, rule: null, problems: [ 'no-rule' ] };
+
+	var s = sections[r];
+
+	if (s.src !== 'lan') problems.push('src');
+	if (s.dest !== 'wan') problems.push('dest');
+	if (String(s.family) !== 'ipv6') problems.push('family');
+	if (String(s.target) === 'DROP') problems.push('drop');
+
+	return { ok: (problems.length === 0), rule: r, problems: problems };
+}
+
 var FW_PROBLEM_TEXT = {
 	'no-zone': '缺少 singbox 防火墙区',
 	'input': 'input 不是 ACCEPT（会拒掉 tun0 回程包）',
@@ -1611,6 +1658,20 @@ var FW_PROBLEM_TEXT = {
 	'lan-forward': '缺少 lan→singbox 转发',
 	'wan-forward': '缺少 wan→singbox 转发'
 };
+
+var IPV6_PROBLEM_TEXT = {
+	'no-rule': '缺少 IPv6 绕过防护规则（客户端 IPv6 会直连 WAN，绕过代理）',
+	'src': 'IPv6 防护规则的 src 不是 lan',
+	'dest': 'IPv6 防护规则的 dest 不是 wan',
+	'family': 'IPv6 防护规则的 family 不是 ipv6',
+	'drop': 'IPv6 防护规则用了 DROP（客户端会干等超时，应改用 REJECT）'
+};
+
+function ipv6ProblemText(problems) {
+	return (problems || []).map(function(p) {
+		return IPV6_PROBLEM_TEXT[p] || p;
+	}).join('；');
+}
 
 function fwProblemText(problems) {
 	return (problems || []).map(function(p) {
@@ -1696,5 +1757,8 @@ return baseclass.extend({
 	uciFindForwarding: uciFindForwarding,
 	uciZoneStatus: uciZoneStatus,
 	fwProblemText: fwProblemText,
+	uciFindIpv6BlockRule: uciFindIpv6BlockRule,
+	uciIpv6BlockStatus: uciIpv6BlockStatus,
+	ipv6ProblemText: ipv6ProblemText,
 	isPrivateIp: isPrivateIp
 });

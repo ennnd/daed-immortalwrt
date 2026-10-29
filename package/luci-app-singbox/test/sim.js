@@ -126,14 +126,16 @@ const fakeFs = {
 				return Promise.resolve({ code: 0, stdout: renderUciShow(a[1]), stderr: '' });
 			}
 
-			/* uci add firewall zone|forwarding：新建段并返回段名 */
+			/* uci add firewall zone|forwarding|rule：新建段并返回段名 */
 			if (a0 === 'add' && a[1] === 'firewall') {
 				const name = 'cfg' + String(++addedCounter).padStart(4, '0');
 
 				if (!uciData.firewall)
 					uciData.firewall = {};
 
-				uciData.firewall[name] = { '.type': a[2] === 'zone' ? 'zone' : 'forwarding' };
+				uciData.firewall[name] = {
+					'.type': (a[2] === 'zone') ? 'zone' : (a[2] === 'rule' ? 'rule' : 'forwarding')
+				};
 
 				return Promise.resolve({ code: 0, stdout: name + '\n', stderr: '' });
 			}
@@ -398,6 +400,19 @@ function load(name) {
 	check('enable 调用了 fw4 reload 让规则生效',
 		enCalls.some(c => c[0] === 'exec' && /fw4$/.test(c[1]) && (c[2] || '') === 'reload'));
 
+	/* --- IPv6 绕过防护：TUN 只有 IPv4，LAN 的 IPv6 出网必须被挡 --- */
+	check('enable 建了 IPv6 防护规则',
+		enCalls.some(c => c[0] === 'exec' && (c[2] || '') === 'add' &&
+			(c[3] || '') === 'firewall' && (c[4] || '') === 'rule'));
+	check('enable 把 IPv6 防护规则的 family 设为 ipv6',
+		uciCall('set', '.family=ipv6'));
+	check('enable 把 IPv6 防护规则的目标设为 REJECT（让客户端快速回退 IPv4）',
+		uciCall('set', '.target=REJECT'));
+	check('enable 把 IPv6 防护规则的 src 设为 lan',
+		uciCall('set', '.src=lan'));
+	check('enable 把 IPv6 防护规则的 dest 设为 wan',
+		uciCall('set', '.dest=wan'));
+
 	/* --- 顺序：fw4 reload 必须早于 sing-box restart，否则 TUN 规则被冲掉 --- */
 	const idxFw4 = enCalls.findIndex(c => c[0] === 'exec' && /fw4$/.test(c[1]));
 	const idxRestart = enCalls.findIndex(c => c[0] === 'exec' &&
@@ -415,6 +430,8 @@ function load(name) {
 	check('enable 后 DNS 判定为经 sing-box', st2.dns_via_singbox === true,
 		JSON.stringify({ noresolv: st2.dns_noresolv, upstream: st2.dns_upstream }));
 	check('enable 后不再判定为旧版接管', st2.dns_taken === false);
+	check('enable 后 IPv6 防护判定为就绪', st2.ipv6_block_ok === true,
+		JSON.stringify(st2.ipv6_block_problems));
 
 	const dis = await api.disable();
 	check('disable 成功', dis.running === false);

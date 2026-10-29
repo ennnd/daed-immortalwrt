@@ -405,6 +405,7 @@ api.status = function() {
 
 		var fsecs = core.parseUciShow(r[9], 'firewall');
 		var fz = core.uciZoneStatus(fsecs);
+		var v6 = core.uciIpv6BlockStatus(fsecs);
 
 		var selected = '';
 
@@ -427,6 +428,8 @@ api.status = function() {
 			dns_upstream_private: (upstream.length > 0 && !publicUpstream),
 			fw_zone_ok: fz.ok,
 			fw_zone_problems: fz.problems,
+			ipv6_block_ok: v6.ok,
+			ipv6_block_problems: v6.problems,
 			uci_enabled: String(r[6]) === '1',
 			urltest_last: selected
 		};
@@ -547,6 +550,58 @@ api.addForwarding = function(src, dest) {
 };
 
 /*
+ * 确保存在"阻断 LAN -> WAN IPv6"的防火墙规则。
+ *
+ * 为什么必须做：sing-box 的 TUN 只分配了 IPv4 地址(172.19.0.1/30)，
+ * 完全不处理 IPv6——ip -6 rule 里没有任何指向 table 2022 的策略路由。
+ * 而运营商下发的 /64 前缀会经 RA/SLAAC 直接给 LAN 客户端全局 IPv6 地址，
+ * 客户端的 IPv6 流量走 fw4 的 lan->wan 直接出 WAN，**绕过 TUN 和代理**，
+ * 网站看到的就是客户端真实的运营商 IPv6，代理形同虚设。
+ *
+ * 节点侧本来也没有 IPv6 出口（代理承载不了这条路径），
+ * 所以正确做法是把 LAN 的 IPv6 出网 REJECT 掉：
+ * REJECT 会回 ICMPv6 unreachable，客户端立刻回退 IPv4；
+ * 用 DROP 则要干等连接超时。
+ */
+api.ensureNoIpv6Bypass = function() {
+	var self = this;
+
+	return self.uciShow('firewall').then(function(text) {
+		var secs = core.parseUciShow(text, 'firewall');
+		var r = core.uciFindIpv6BlockRule(secs);
+
+		if (!r) {
+			return self.uci([ 'add', 'firewall', 'rule' ]).then(function(res) {
+				r = String(res.stdout || '').trim();
+
+				if (!r)
+					throw new Error(_('创建 IPv6 防护规则失败'));
+
+				return self.uci([ 'set', 'firewall.' + r + '.name=Block-LAN-IPv6-Egress' ])
+					.then(function() { return self.finishIpv6Block(r); });
+			});
+		}
+
+		return self.finishIpv6Block(r);
+	});
+};
+
+api.finishIpv6Block = function(r) {
+	var self = this;
+	var cmds = [
+		[ 'set', 'firewall.' + r + '.src=lan' ],
+		[ 'set', 'firewall.' + r + '.dest=wan' ],
+		[ 'set', 'firewall.' + r + '.family=ipv6' ],
+		[ 'set', 'firewall.' + r + '.proto=all' ],
+		[ 'set', 'firewall.' + r + '.target=REJECT' ]
+	];
+
+	return self.uciSeq(cmds).then(function() {
+		return self.uci([ 'commit', 'firewall' ]);
+	});
+};
+
+/*
  * 把 dnsmasq 的上游 DNS 改成公网解析器，并禁用读 resolv.conf。
  *
  * 这是"开了 sing-box 国外全挂"的真正根因（不是节点、不是 MTU、不是防火墙）：
@@ -608,6 +663,9 @@ api.enable = function() {
 		/* 防火墙必须排在 sing-box 之前：fw4 reload 会把 TUN 规则冲掉，
 		   所以先 reload 防火墙、再启动 sing-box。 */
 		return self.ensureFirewallZone();
+	}).then(function() {
+		/* 防 IPv6 绕过代理：TUN 只有 IPv4，客户端 IPv6 会直连 WAN 泄漏真实 IP */
+		return self.ensureNoIpv6Bypass();
 	}).then(function() {
 		/* dnsmasq 上游改公网解析器（否则国外域名被投毒，见 ensureDnsUpstream 注释） */
 		return self.ensureDnsUpstream();

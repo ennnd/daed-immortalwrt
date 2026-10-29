@@ -57,7 +57,37 @@ ensure_singbox_fw() {
   uci commit firewall
   fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
 }
+
+# ★ 阻断 LAN -> WAN 的 IPv6（防 IPv6 绕过代理泄漏真实 IP）
+#   本配置的 TUN 只分配了 IPv4 地址(172.19.0.1/30)，sing-box 完全不处理 IPv6：
+#   - ip -6 rule 里没有任何指向 table 2022 的策略路由；
+#   - sing-box 也没有 ipv6 的 auto_route；
+#   而运营商下发的 /64 前缀会经 RA/SLAAC 直接给 LAN 客户端全局 IPv6 地址。
+#   结果：客户端 IPv6 流量走 fw4 的 lan->wan 直接出 WAN，**完全绕过 TUN 和代理**，
+#   网站看到的是客户端真实的运营商 IPv6，代理形同虚设（实测 v6 直连 Cloudflare 通、
+#   出口即运营商真实 IPv6）。
+#   节点侧也没有 IPv6 出口（ping6 节点地址 FAIL），所以这条路径本来也走不通代理，
+#   最合理的做法就是把 LAN 的 IPv6 出网 REJECT 掉——客户端会立刻收到
+#   ICMPv6 unreachable 而快速回退 IPv4（而不是 DROP 那样干等超时）。
+ensure_no_ipv6_bypass() {
+  local r="" i
+  # 用 section 名定位（不能用数字下标，同 ensure_singbox_fw 里的原因）
+  r=$(uci -q show firewall | sed -n "s/^firewall\.\(@rule\[[0-9]*\]\|cfg[0-9a-fA-F]*\)\.name='Block-LAN-IPv6-Egress'$/\1/p" | head -1)
+  if [ -z "$r" ]; then
+    r=$(uci add firewall rule)
+    uci set firewall.$r.name='Block-LAN-IPv6-Egress'
+  fi
+  uci set firewall.$r.src='lan'
+  uci set firewall.$r.dest='wan'
+  uci set firewall.$r.family='ipv6'
+  uci set firewall.$r.proto='all'
+  uci set firewall.$r.target='REJECT'
+  uci commit firewall
+}
+
 ensure_singbox_fw
+ensure_no_ipv6_bypass
+fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
 
 # ★ dnsmasq 上游 DNS 改成公网解析器（见 99-singbox 里同一段注释的完整说明）。
 #   不改的话 dnsmasq 问上游路由器(192.168.18.1)的流量会绕过 TUN，

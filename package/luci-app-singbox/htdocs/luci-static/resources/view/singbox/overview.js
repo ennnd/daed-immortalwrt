@@ -146,6 +146,9 @@ return view.extend({
 			sbui.kvRow(_('防火墙区'), st.fw_zone_ok
 				? sbui.badge(_('正常'), 'ok')
 				: sbui.badge(_('未正确配置'), 'bad')),
+			sbui.kvRow(_('IPv6 防护'), st.ipv6_block_ok
+				? sbui.badge(_('已阻断（无绕过）'), 'ok')
+				: sbui.badge(_('存在 IPv6 绕过'), 'bad')),
 			sbui.kvRow(_('urltest 最近选择'), st.urltest_last || '—',
 				'font-family:monospace;font-size:11px;word-break:break-all')
 		];
@@ -205,6 +208,13 @@ return view.extend({
 			children.unshift(sbui.warn(
 				_('singbox 防火墙区未正确配置：') + core.fwProblemText(st.fw_zone_problems) +
 				_('。这会导致 LAN 客户端上不了网或代理回程被拒。点「启用」可自动修复。')));
+		}
+
+		if (!st.ipv6_block_ok) {
+			children.unshift(sbui.warn(
+				_('IPv6 绕过防护未就绪：') + core.ipv6ProblemText(st.ipv6_block_problems) +
+				_('。本配置的 TUN 只处理 IPv4，若不阻断 LAN 的 IPv6 出网，' +
+				'客户端会用真实运营商 IPv6 直连，代理被绕过、真实 IP 泄漏。点「启用」可自动修复。')));
 		}
 
 		if (this.placeholders.length) {
