@@ -1,2 +1,4 @@
 # sing-box watchdog: 每 2 分钟检测国外站点(google)可达性；代理连不上国外但国内正常时，自动停止 sing-box 并恢复直连
 */2 * * * * /usr/bin/singbox-watchdog
+# sing-box 订阅：每 6 小时拉一次节点，节点有变化才重启
+17 */6 * * * /usr/bin/singbox-subscribe

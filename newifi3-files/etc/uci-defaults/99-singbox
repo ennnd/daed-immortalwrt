@@ -7,7 +7,8 @@
 # 修可执行位：overlay 里的文件如果以 644 落到 /usr/bin，cron 会静默调用失败
 # （只写一条 cron.err），看门狗和 iface 热插拔脚本就此永久失效。
 chmod 755 /usr/bin/singbox-on /usr/bin/singbox-off /usr/bin/singbox-safestop \
-          /usr/bin/singbox-watchdog /etc/hotplug.d/iface/99-singbox 2>/dev/null || true
+          /usr/bin/singbox-watchdog /usr/bin/singbox-subscribe \
+          /etc/hotplug.d/iface/99-singbox 2>/dev/null || true
 
 z=""
 # 用 section 名定位，不能用数字下标：uci set firewall.2.input=... 会报
@@ -86,12 +87,14 @@ uci add_list dhcp.@dnsmasq[0].server='119.29.29.29'
 uci commit dhcp
 /etc/init.d/dnsmasq restart 2>/dev/null || true
 
-# 启用 cron，安装 sing-box watchdog（每 2 分钟检测国外站点，代理连不上国外但国内正常时自动停止 sing-box）
+# 启用 cron：看门狗每 2 分钟跑一次；订阅每 6 小时更新一次节点
 if [ -x /etc/init.d/cron ]; then
   cat > /etc/crontabs/root <<'CRON'
-# sing-box watchdog: 每 2 分钟检测国外站点可达性（google 为主、baidu 做对照），
+# sing-box watchdog: 每 2 分钟检测国外站点可达性（cloudflare/google 双目标、要求 204 空响应），
 # 国外不可达但国内可达 -> 代理坏，自动停止 sing-box 并恢复直连
 */2 * * * * /usr/bin/singbox-watchdog
+# sing-box 订阅：每 6 小时拉一次节点，节点有变化才重启（需要 /etc/sing-box/subscription.url）
+17 */6 * * * /usr/bin/singbox-subscribe
 CRON
   /etc/init.d/cron enable 2>/dev/null
   /etc/init.d/cron restart 2>/dev/null

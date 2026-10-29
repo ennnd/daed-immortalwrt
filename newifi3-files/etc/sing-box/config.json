@@ -10,7 +10,8 @@
   // 本文件支持 // 注释（sing-box 的 JSON 解析器允许注释）。
   //
   // ★ 节点的 "server" 字段请填**域名**，不要填写死的 IP。
-  //   机场的入口 IP 会轮换，历史上写死 23.106.128.103 就因 IP 过期整条线挂掉；
+  //   机场的入口 IP 会轮换，历史上写死某个入口 IP 就因它过期导致整条线挂掉
+  //   （具体 IP 属于节点凭据，不写进仓库，示例统一用 203.0.113.10）；
   //   填域名后 sing-box 会通过 default_domain_resolver 自动跟随解析。
   // ====================================================================
   "log": {
@@ -102,6 +103,7 @@
     }
   ],
   "outbounds": [
+    // >>> NODES BEGIN (managed by singbox-subscribe)
     {
       // proxy 是 route.final 指向的出口，也是 LuCI「节点选择」下拉框操作的对象。
       // 默认 auto（urltest 自动选延迟最低的节点）；想手动锁某台机器就在 UI 里选，
@@ -196,6 +198,7 @@
       "tag": "direct",
       "reuse_addr": true
     }
+    // <<< NODES END
   ],
   "route": {
     "rules": [

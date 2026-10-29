@@ -1,0 +1,444 @@
+#!/bin/sh
+# singbox-subscribe —— 从机场订阅拉取节点，按关键字筛选后生成 sing-box 配置
+#
+# 为什么需要它：机场节点换得快，写死在 config.json 里的节点过期后整条线会挂，
+# 表现为“能上国内、上不了国外”，看门狗再把代理停掉，直到你手动更新。
+#
+# 用法：
+#   singbox-subscribe              拉订阅、更新配置、校验、平滑重启
+#   singbox-subscribe -n           只拉取并打印统计，不写配置（dry-run）
+#   singbox-subscribe -f FILE      从本地文件读订阅内容（不联网，用于测试）
+#   singbox-subscribe -l           列出订阅里的节点名，不做任何改动
+#
+# 依赖文件：
+#   /etc/sing-box/subscription.url      订阅链接（600，勿入库）
+#   /etc/sing-box/subscription.filter   关键字筛选，一行一个：
+#                                         IEPL          保留名字含 IEPL 的
+#                                         !过期         丢掉名字含“过期”的
+#                                       规则：只要写了任一“保留关键字”，就只留命中这些关键字的
+#                                       节点；以 ! 开头的是排除项，优先级最高。
+#
+# 安全：订阅链接等同于账号密码，脚本不会把它写进日志。
+#
+# 依赖（ImmortalWrt 25.x 已改用 apk；busybox 没有 base64）：
+#   apk add jq coreutils-base64
+
+set -u
+
+CONF=${SINGBOX_SUB_CONF:-/etc/sing-box/config.json}
+URLF=${SINGBOX_SUB_URL_FILE:-/etc/sing-box/subscription.url}
+FILTF=${SINGBOX_SUB_FILTER:-/etc/sing-box/subscription.filter}
+WORK=/tmp/sb-sub
+TAG=singbox-subscribe
+MAX_NODES=32
+UA="sing-box/1.14.3"
+
+DRY=0
+LIST=0
+SRC_FILE=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-n|--dry-run) DRY=1 ;;
+		-l|--list)    LIST=1 ;;
+		-f|--file)    SRC_FILE="${2:-}"; shift ;;
+		-h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
+		*) echo "未知参数: $1" >&2; exit 2 ;;
+	esac
+	shift
+done
+
+log() { logger -t "$TAG" "$*"; echo "$*"; }
+die() { logger -t "$TAG" "ERROR: $*"; echo "ERROR: $*" >&2; exit 1; }
+
+rm -rf "$WORK"; mkdir -p "$WORK"
+
+# ---------------------------------------------------------------- 取回订阅
+raw="$WORK/raw"
+
+if [ -n "$SRC_FILE" ]; then
+	[ -s "$SRC_FILE" ] || die "文件为空或不存在: $SRC_FILE"
+	cp "$SRC_FILE" "$raw"
+else
+	[ -s "$URLF" ] || die "缺少订阅链接文件 $URLF（chmod 600，内容是完整 URL）"
+	url=$(tr -d '\r\n' < "$URLF")
+
+	case "$url" in
+		http://*|https://*) ;;
+		*) die "$URLF 里不是一个 http(s) 链接" ;;
+	esac
+
+	if ! uclient-fetch -q -T 20 -U "$UA" -O "$raw" "$url" 2>/dev/null; then
+		sleep 2
+		uclient-fetch -q -T 25 -U "$UA" -O "$raw" "$url" 2>/dev/null || die "订阅下载失败（网络或链接失效）"
+	fi
+	[ -s "$raw" ] || die "订阅内容为空"
+fi
+
+# ---------------------------------------------------------------- 识别格式
+# 三种常见形态：sing-box JSON / Clash YAML / base64(分享链接列表)
+uris="$WORK/uris"
+mode=""
+
+first=$(head -c 1 "$raw" 2>/dev/null)
+
+if [ "$first" = "{" ]; then
+	mode=json
+elif grep -qiE '^[[:space:]]*proxies[[:space:]]*:' "$raw" 2>/dev/null; then
+	mode=yaml
+else
+	# 可能是 base64，也可能本身就是明文分享链接
+	if grep -q '://' "$raw" 2>/dev/null; then
+		mode=plain
+		tr -d '\r' < "$raw" | grep '://' > "$uris"
+	else
+		tr -d '\r\n ' < "$raw" | tr -- '-_' '+/' | base64 -d 2>/dev/null > "$WORK/dec" || die "无法识别订阅格式（既不是 JSON/YAML，也不是合法的 base64）"
+		grep '://' "$WORK/dec" > "$uris" 2>/dev/null
+		mode=b64
+	fi
+fi
+
+case "$mode" in
+	yaml)
+		die "订阅是 Clash YAML 格式，本脚本不解析（YAML 需要 yq，路由器上没有）。
+     解决办法：在订阅链接后加机场的「通用/base64」参数，或改用 base64 订阅地址。"
+		;;
+	json)
+		# sing-box / v2ray JSON：直接把 outbounds 里可用的节点抽出来
+		jq -c '.outbounds[]?
+		       | select(.type != "selector" and .type != "urltest"
+		                and .type != "direct" and .type != "block" and .type != "dns")
+		       | select((.server // "") != "")' "$raw" > "$WORK/nodes.ndjson" 2>/dev/null
+		[ -s "$WORK/nodes.ndjson" ] || die "JSON 订阅里没有找到可用 outbound"
+		;;
+	plain|b64)
+		[ -s "$uris" ] || die "订阅里没有解析出任何节点链接"
+		;;
+esac
+
+# ---------------------------------------------------------------- 解析链接
+# 只支持这几种主流协议；其他（hysteria/tuic 等）跳过并计数
+qval() {
+	# $1=query 串 $2=键名
+	printf '%s' "$1" | tr '&' '\n' | sed -n "s/^$2=//p" | head -n 1
+}
+
+urld() {
+	# URL 解码（jq 1.8 的 @urid），失败时原样返回
+	printf '%s' "$1" | jq -Rr '@urid' 2>/dev/null || printf '%s' "$1"
+}
+
+b64d() {
+	# 容错 base64 解码：去换行、补 padding、兼容 base64url
+	s=$(printf '%s' "$1" | tr -d '\r\n' | tr -- '-_' '+/')
+	case $(( ${#s} % 4 )) in
+		2) s="$s==" ;;
+		3) s="$s=" ;;
+	esac
+	printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+parse_vless() {
+	# $1=scheme 之后的整体
+	body=$1
+	case "$body" in *"#"*) frag=${body#*#}; body=${body%%#*} ;; *) frag="" ;; esac
+	case "$body" in *"?"*) query=${body#*\?}; body=${body%%\?*} ;; *) query="" ;; esac
+	user=${body%@*}; hp=${body##*@}
+
+	host=${hp%:*}; port=${hp##*:}
+	case "$host" in \[*\]) host=$(printf '%s' "$host" | tr -d '[]') ;; esac
+	case "$port" in ''|*[!0-9]*) port=443 ;; esac
+
+	sec=$(qval "$query" security); [ -n "$sec" ] || sec=tls
+	sni=$(urld "$(qval "$query" sni)")
+	pbk=$(qval "$query" pbk)
+	sid=$(qval "$query" sid)
+	fp=$(qval "$query" fp)
+	flow=$(qval "$query" flow)
+	net=$(qval "$query" type)
+	[ -n "$net" ] || net=tcp
+	path=$(urld "$(qval "$query" path)")
+	hhost=$(urld "$(qval "$query" host)")
+	name=$(urld "$frag")
+	[ -n "$name" ] || name="$host:$port"
+
+	jq -cn \
+		--arg tag "$name" --arg server "$host" --argjson port "$port" --arg uuid "$user" \
+		--arg flow "$flow" --arg sni "$sni" --arg fp "$fp" --arg pbk "$pbk" --arg sid "$sid" \
+		--arg net "$net" --arg path "$path" --arg hhost "$hhost" --arg sec "$sec" '
+		{ type: "vless", tag: $tag, server: $server, server_port: $port, uuid: $uuid }
+		+ (if $flow != "" and $flow != "none" then { flow: $flow } else {} end)
+		+ (if ($sec == "tls" or $sec == "reality") then
+			{ tls: ({ enabled: true }
+				+ (if $sni != "" then { server_name: $sni } else {} end)
+				+ (if $fp  != "" then { utls: { enabled: true, fingerprint: $fp } } else {} end)
+				+ (if $sec == "reality" then
+					{ reality: ({ enabled: true }
+						+ (if $pbk != "" then { public_key: $pbk } else {} end)
+						+ (if $sid != "" then { short_id: $sid } else {} end)) }
+				   else {} end)) }
+		   else {} end)
+		+ (if $net == "ws" then
+			{ transport: ({ type: "ws" }
+				+ (if $path  != "" then { path: $path } else {} end)
+				+ (if $hhost != "" then { headers: { Host: $hhost } } else {} end)) }
+		   elif $net == "grpc" then
+			{ transport: { type: "grpc", service_name: (if $path != "" then $path else "" end) } }
+		   else {} end)
+	'
+}
+
+parse_trojan() {
+	body=$1
+	case "$body" in *"#"*) frag=${body#*#}; body=${body%%#*} ;; *) frag="" ;; esac
+	case "$body" in *"?"*) query=${body#*\?}; body=${body%%\?*} ;; *) query="" ;; esac
+	pass=${body%@*}; hp=${body##*@}
+
+	host=${hp%:*}; port=${hp##*:}
+	case "$host" in \[*\]) host=$(printf '%s' "$host" | tr -d '[]') ;; esac
+	case "$port" in ''|*[!0-9]*) port=443 ;; esac
+
+	sni=$(urld "$(qval "$query" sni)")
+	[ -n "$sni" ] || sni=$(urld "$(qval "$query" peer)")
+	[ -n "$sni" ] || sni="$host"
+	name=$(urld "$frag")
+	[ -n "$name" ] || name="$host:$port"
+
+	jq -cn --arg tag "$name" --arg server "$host" --argjson port "$port" \
+		--arg pass "$pass" --arg sni "$sni" '
+		{ type: "trojan", tag: $tag, server: $server, server_port: $port,
+		  password: $pass, tls: { enabled: true, server_name: $sni } }'
+}
+
+parse_ss() {
+	body=$1
+	case "$body" in *"#"*) frag=${body#*#}; body=${body%%#*} ;; *) frag="" ;; esac
+	case "$body" in *"?"*) query=${body#*\?}; body=${body%%\?*} ;; *) query="" ;; esac
+	user=${body%@*}; hp=${body##*@}
+
+	host=${hp%:*}; port=${hp##*:}
+	case "$host" in \[*\]) host=$(printf '%s' "$host" | tr -d '[]') ;; esac
+	case "$port" in ''|*[!0-9]*) port=443 ;; esac
+
+	case "$user" in
+		*:*)
+			method=${user%%:*}
+			pass=${user#*:}
+			;;
+		*)
+			dec=$(b64d "$user")
+			case "$dec" in
+				*@*)
+					# 老格式：整段 base64(method:pass@host:port)
+					method=${dec%%:*}
+					rest=${dec#*:}
+					pass=${rest%%@*}
+					inner=${dec##*@}
+					host=${inner%:*}; port=${inner##*:}
+					;;
+				*)
+					method=${dec%%:*}
+					pass=${dec#*:}
+					;;
+			esac
+			;;
+	esac
+
+	name=$(urld "$frag")
+	[ -n "$name" ] || name="$host:$port"
+
+	jq -cn --arg tag "$name" --arg server "$host" --argjson port "$port" \
+		--arg method "$method" --arg pass "$pass" '
+		{ type: "shadowsocks", tag: $tag, server: $server, server_port: $port,
+		  method: $method, password: $pass }'
+}
+
+parse_vmess() {
+	dec=$(b64d "$1")
+	[ -n "$dec" ] || return 1
+	printf '%s' "$dec" | jq -e . >/dev/null 2>&1 || return 1
+
+	printf '%s' "$dec" | jq -c '
+		{
+		  type: "vmess",
+		  tag: (if (.ps // "") == "" then ((.add // "") + ":" + ((.port // 0) | tostring)) else .ps end),
+		  server: .add,
+		  server_port: ((.port // 0) | tonumber),
+		  uuid: .id,
+		  alter_id: ((.aid // 0) | tonumber),
+		  security: (.scy // "auto")
+		}
+		+ (if ((.tls // "") == "tls") then { tls: { enabled: true, server_name: (if (.sni // "") == "" then .add else .sni end) } } else {} end)
+		+ (if ((.net // "tcp") == "ws") then
+			{ transport: ({ type: "ws" }
+				+ (if (.path // "") != "" then { path: .path } else {} end)
+				+ (if (.host // "") != "" then { headers: { Host: .host } } else {} end)) }
+		   else {} end)
+	' 2>/dev/null
+}
+
+nodes="$WORK/nodes.ndjson"
+: > "$nodes"
+
+skipped=0
+parsed=0
+
+if [ "$mode" = "json" ]; then
+	cp "$WORK/nodes.ndjson" "$WORK/json-nodes"
+	cp "$WORK/json-nodes" "$nodes"
+	parsed=$(wc -l < "$nodes")
+else
+	while IFS= read -r uri; do
+		[ -n "$uri" ] || continue
+		scheme=$(printf '%s' "$uri" | sed -n 's#^\([a-zA-Z0-9]*\)://.*#\1#p' | tr 'A-Z' 'a-z')
+		rest=${uri#*://}
+		out=""
+		case "$scheme" in
+			vless)  out=$(parse_vless "$rest") ;;
+			trojan) out=$(parse_trojan "$rest") ;;
+			ss)     out=$(parse_ss "$rest") ;;
+			vmess)  out=$(parse_vmess "$rest") ;;
+			*)      skipped=$((skipped + 1)); continue ;;
+		esac
+		[ -n "$out" ] || { skipped=$((skipped + 1)); continue; }
+		printf '%s\n' "$out" >> "$nodes"
+		parsed=$((parsed + 1))
+	done < "$uris"
+fi
+
+[ "$parsed" -gt 0 ] || die "一个节点都没解析出来（共跳过 $skipped 个不支持的协议）"
+
+# ---------------------------------------------------------------- 关键字筛选
+# 规则：有任一“保留”关键字时只留命中的；!开头为排除，优先级最高
+keep_re=""
+excl_re=""
+
+if [ -s "$FILTF" ]; then
+	while IFS= read -r kw; do
+		kw=$(printf '%s' "$kw" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+		[ -n "$kw" ] || continue
+		case "$kw" in \#*) continue ;; esac
+		case "$kw" in
+			!*) excl_re="${excl_re}|$(printf '%s' "${kw#!}" | tr 'A-Z' 'a-z')" ;;
+			*)  keep_re="${keep_re}|$(printf '%s' "$kw" | tr 'A-Z' 'a-z')" ;;
+		esac
+	done < "$FILTF"
+fi
+
+keep_re=${keep_re#|}
+excl_re=${excl_re#|}
+
+filtered="$WORK/filtered.ndjson"
+: > "$filtered"
+n_keep=0
+n_drop=0
+
+while IFS= read -r line; do
+	[ -n "$line" ] || continue
+	name=$(printf '%s' "$line" | jq -r '.tag // ""' 2>/dev/null | tr 'A-Z' 'a-z')
+
+	if [ -n "$excl_re" ] && printf '%s' "$name" | grep -qE "$excl_re"; then
+		n_drop=$((n_drop + 1)); continue
+	fi
+
+	if [ -n "$keep_re" ]; then
+		if printf '%s' "$name" | grep -qE "$keep_re"; then
+			n_keep=$((n_keep + 1))
+		else
+			n_drop=$((n_drop + 1)); continue
+		fi
+	fi
+
+	printf '%s\n' "$line" >> "$filtered"
+done < "$nodes"
+
+total=$(wc -l < "$filtered" | tr -d ' ')
+[ "$total" -gt 0 ] || die "筛选后没有节点（保留规则: ${keep_re:-无}，排除: ${excl_re:-无}）"
+
+# 超过上限则截断（顺序即订阅顺序，机场通常把好节点排前面）
+if [ "$total" -gt "$MAX_NODES" ]; then
+	head -n "$MAX_NODES" "$filtered" > "$filtered.tmp" && mv "$filtered.tmp" "$filtered"
+	total=$MAX_NODES
+fi
+
+# tag 去重：同名节点加序号，否则 sing-box 会因 tag 冲突拒绝启动
+jq -s '
+	reduce .[] as $n ({ seen: {}, out: [] };
+		(($n.tag // "node") | tostring) as $base
+		| ( .seen[$base] // 0 ) as $c
+		| .seen[$base] = ($c + 1)
+		| .out += [ $n + { tag: (if $c == 0 then $base else ($base + " #" + (($c + 1) | tostring)) end) } ]
+	) | .out
+' "$filtered" > "$WORK/nodes.json" 2>/dev/null || die "节点 JSON 合并失败"
+
+[ "$LIST" = "1" ] && { jq -r '.[].tag' "$WORK/nodes.json"; exit 0; }
+
+if [ "$DRY" = "1" ]; then
+	echo "格式=$mode  解析=$parsed  跳过=$skipped  保留=$total  丢弃=$n_drop"
+	echo "--- 节点列表 ---"
+	jq -r '.[].tag' "$WORK/nodes.json"
+	exit 0
+fi
+
+# ---------------------------------------------------------------- 生成 outbounds
+jq '
+	(map(.tag)) as $tags
+	| [ { type: "selector", tag: "proxy",
+	      outbounds: (["auto"] + $tags), default: "auto" },
+	    { type: "urltest", tag: "auto",
+	      outbounds: $tags,
+	      url: "https://cp.cloudflare.com/generate_204",
+	      interval: "3m", tolerance: 50 },
+	    { type: "direct", tag: "direct" } ] + .
+' "$WORK/nodes.json" > "$WORK/outbounds.json" || die "生成 outbounds 失败"
+
+# 去掉最外层 [ ]，其余缩进正好落进 config 的 outbounds 数组（补 2 空格对齐）
+jq . "$WORK/outbounds.json" | sed '1d;$d' | sed 's/^/  /' > "$WORK/ob.txt"
+
+grep -q '>>> NODES BEGIN' "$CONF" || die "配置里缺少标记 // >>> NODES BEGIN，无法安全替换（请先给 outbounds 加标记）"
+grep -q '<<< NODES END' "$CONF" || die "配置里缺少标记 // <<< NODES END"
+
+# 拼接：标记前 + 新节点 + 标记后
+sed -n '1,/>>> NODES BEGIN/p' "$CONF" > "$WORK/config.new"
+cat "$WORK/ob.txt" >> "$WORK/config.new"
+sed -n '/<<< NODES END/,$p' "$CONF" >> "$WORK/config.new"
+
+# 节点完全没变就不重启，避免每 6 小时把连接打断一次
+new_md5=$(md5sum < "$WORK/ob.txt" | cut -d' ' -f1)
+old_md5=$(cat /etc/sing-box/.nodes.md5 2>/dev/null)
+if [ -n "$old_md5" ] && [ "$new_md5" = "$old_md5" ]; then
+	log "节点无变化（$total 个），跳过重启"
+	exit 0
+fi
+
+sing-box check -c "$WORK/config.new" >/dev/null 2>&1 \
+	|| { sing-box check -c "$WORK/config.new" 2>&1 | tail -5; die "新配置校验失败，已放弃（原配置未改动）"; }
+
+cp "$CONF" "$CONF.bak.subscribe"
+cp "$WORK/config.new" "$CONF"
+printf '%s\n' "$new_md5" > /etc/sing-box/.nodes.md5
+
+log "已更新 $total 个节点（解析 $parsed，跳过 $skipped，筛掉 $n_drop）"
+
+# ---------------------------------------------------------------- 生效
+if pidof sing-box >/dev/null 2>&1; then
+	rm -f /tmp/.sb_wd_seen            # 重启后给看门狗重新计时，避免刚起来就被判死
+	/etc/init.d/sing-box restart >/dev/null 2>&1
+	sleep 4
+	i=0
+	while [ "$i" -lt 10 ]; do
+		pidof sing-box >/dev/null 2>&1 && break
+		sleep 1; i=$((i + 1))
+	done
+
+	if ! pidof sing-box >/dev/null 2>&1; then
+		cp "$CONF.bak.subscribe" "$CONF"
+		/etc/init.d/sing-box restart >/dev/null 2>&1
+		die "重启后 sing-box 未起来，已回滚到上一版配置"
+	fi
+	log "sing-box 已重启（pid $(pidof sing-box)）"
+else
+	log "sing-box 当前未运行，配置已更新，下次启用时生效"
+fi
+
+exit 0
