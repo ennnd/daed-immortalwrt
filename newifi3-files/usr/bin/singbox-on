@@ -120,6 +120,11 @@ uci commit sing-box
 /etc/init.d/sing-box enable
 /etc/init.d/sing-box restart
 
+# 重置看门狗的宽限期计时：watchdog 以 /tmp/.sb_wd_seen 的 mtime 为起点，
+# 不在这里删掉的话，手动重启代理后的第一次检查没有 GRACE 缓冲，
+# 节点还在握手/urltest 还没探完就会被判成“代理坏了”直接停掉。
+rm -f /tmp/.sb_wd_seen
+
 sleep 1
 i=0
 while [ "$i" -lt 10 ]; do
