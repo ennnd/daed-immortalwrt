@@ -30,11 +30,6 @@ var DNS_UPSTREAM = [ '223.5.5.5', '119.29.29.29' ];
 var MAX_SUB = 200 * 1024;
 var MAX_BAK = 5;
 
-var RULESET_URL = {
-	'geosite-cn': 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
-	'geoip-cn': 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs'
-};
-
 var api = {};
 
 /* ---------------- 基础 ---------------- */
@@ -807,30 +802,195 @@ api.fetchSubscription = function(url, ua) {
 	});
 };
 
-api.updateRuleSet = function(tag) {
-	var url = RULESET_URL[tag];
+/*
+ * 规则集更新
+ * ==========
+ *
+ * 数据源：SagerNet 的 rule-set 分支（不是 release）。
+ *   注意：SagerNet 的 **release** 里现在只有 `.db`（那是给别的程序用的格式），
+ *   实测 sing-box 1.14.3 拒绝加载，报 "invalid sing-box rule-set file"。
+ *   真正能给 sing-box 用的是 `rule-set` 分支下的 `.srs`（魔数 "SRS\x01"）。
+ *
+ * 真实大小（2026-10）：geoip-cn.srs ≈ 33KB、geosite-cn.srs ≈ 55KB。
+ * 所以**绝不能**用"小于 100KB 判失败"——那会把两个合法文件都删掉。
+ * 完整性改用下面四道校验，任何一道不过就不落盘、保留旧文件：
+ *
+ *   1. sing-box rule-set decompile  → 能完整解出来（截断文件会 "unexpected EOF"，
+ *      HTML 错误页会 "invalid sing-box rule-set file"，空文件会 "EOF"）
+ *   2. 解出来的 JSON 里有非空 rules 数组
+ *   3. 正向探针：拿一个"必定属于该集合"的 IP/域名去 match，必须命中
+ *   4. 反向探针：拿一个"必定不属于该集合"的去 match，必须不命中
+ *
+ * 下载源做多镜像回退（GitHub raw / jsDelivr / ghproxy），任一成功即可。
+ */
+var RULESET_SOURCES = {
+	'geoip-cn': {
+		file: 'geoip-cn.srs',
+		mirrors: [
+			'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
+			'https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs',
+			'https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs'
+		],
+		/* 223.5.5.5 是阿里 DNS，必属 CN；8.8.8.8 必不属 CN */
+		matchAny: [ '223.5.5.5', '119.29.29.29' ],
+		matchNone: [ '8.8.8.8' ]
+	},
+	'geosite-cn': {
+		file: 'geosite-cn.srs',
+		mirrors: [
+			'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
+			'https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs',
+			'https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs'
+		],
+		/* baidu.com 必属 CN 站点；google.com 必不属 CN */
+		matchAny: [ 'baidu.com', 'qq.com' ],
+		matchNone: [ 'google.com' ]
+	}
+};
 
-	if (!url)
-		return Promise.reject(new Error(_('这个规则集不支持自动更新')));
+api.ruleSetSupported = function(tag) {
+	return !!RULESET_SOURCES[tag];
+};
 
-	var dst = '/etc/sing-box/rule-set/' + tag + '.srs';
+api.ruleSetPath = function(tag) {
+	var spec = RULESET_SOURCES[tag];
 
-	return api.fetch([ '-q', '-O', dst, '--timeout=20', url ])
-		.then(function(res) {
-			if (res.code !== 0)
-				throw new Error(_('下载失败') + ': ' + core.trimStr(res.stderr || res.stdout));
+	return '/etc/sing-box/rule-set/' + (spec ? spec.file : tag + '.srs');
+};
 
-			return fs.stat(dst).catch(function() { return null; });
-		}).then(function(st) {
-			var size = (st && st.size) ? st.size : 0;
+/* 依次尝试镜像下载到 dst；全部失败则 reject */
+api.downloadRuleSet = function(tag, dst) {
+	var spec = RULESET_SOURCES[tag];
+	var i = 0;
+	var errors = [];
 
-			if (size < 100 * 1024) {
-				fs.remove(dst).catch(function() {});
-				throw new Error(_('下载到的文件太小（') + size + _(' 字节），已删除'));
+	function next() {
+		if (i >= spec.mirrors.length)
+			return Promise.reject(new Error(_('所有下载源都失败') + '：' + errors.join('；')));
+
+		var url = spec.mirrors[i++];
+
+		return api.fetch([ '-q', '-O', dst, '--timeout=30', url ]).then(function(res) {
+			if (res.code !== 0) {
+				errors.push(core.trimStr(res.stderr || res.stdout || ('rc=' + res.code)).slice(0, 80));
+				return next();
 			}
 
-			return { tag: tag, size: size };
+			return { url: url };
 		});
+	}
+
+	return next();
+};
+
+/*
+ * 对一个候选 .srs 做完整校验。返回 Promise<{ rules, size }>，失败则 reject。
+ */
+api.validateRuleSet = function(tag, tmp) {
+	var spec = RULESET_SOURCES[tag];
+	var tmpJson = tmp + '.json';
+
+	function fail(msg) {
+		return fs.remove(tmp).catch(function() {})
+			.then(function() { return fs.remove(tmpJson).catch(function() {}); })
+			.then(function() { throw new Error(msg); });
+	}
+
+	/* 第 1 道：decompile —— 结构完整性（截断/HTML/空文件都会在这里被抓到） */
+	return api.exec('/usr/bin/sing-box', [ 'rule-set', 'decompile', tmp, '-o', tmpJson ])
+		.then(function(res) {
+			if (res.code !== 0) {
+				var why = core.trimStr(res.stderr || res.stdout || ('rc=' + res.code));
+
+				if (/unexpected EOF|EOF/i.test(why))
+					return fail(_('文件不完整（下载被截断）') + '：' + why.slice(0, 100));
+				if (/invalid sing-box rule-set/i.test(why))
+					return fail(_('不是有效的 .srs 文件（可能下到了错误页）') + '：' + why.slice(0, 100));
+
+				return fail(_('rule-set 解析失败') + '：' + why.slice(0, 100));
+			}
+
+			/* 第 2 道：解出来的 JSON 结构 */
+			return fs.read(tmpJson);
+		}).then(function(txt) {
+			var v = core.validateRuleSetJson(txt);
+
+			if (!v.ok) {
+				if (v.error === 'no-rules')
+					return fail(_('规则集里没有任何规则，已丢弃'));
+
+				return fail(_('规则集内容损坏（JSON 解析失败），已丢弃'));
+			}
+
+			/* 第 3 道：正向探针，必须至少命中一个 */
+			return api.exec('/usr/bin/sing-box', [ 'rule-set', 'match', '--format', 'binary', tmp, spec.matchAny[0] ])
+				.then(function(res) {
+					if (!core.ruleSetMatchHit(res.stdout))
+						return fail(_('内容校验未通过：') + spec.matchAny[0] + _(' 不在该规则集里，已丢弃'));
+
+					/* 第 4 道：反向探针，必须不命中 */
+					return api.exec('/usr/bin/sing-box', [ 'rule-set', 'match', '--format', 'binary', tmp, spec.matchNone[0] ]);
+				}).then(function(res) {
+					if (core.ruleSetMatchHit(res.stdout))
+						return fail(_('内容校验未通过：') + spec.matchNone[0] + _(' 不该在该规则集里，已丢弃'));
+
+					return fs.stat(tmp).catch(function() { return null; });
+				}).then(function(st) {
+					return fs.remove(tmpJson).catch(function() {}).then(function() {
+						return { rules: v.rules, size: (st && st.size) ? st.size : 0 };
+					});
+				});
+		}).catch(function(e) {
+			/* fail() 抛出的错误直接透传；其它异常也清理临时文件 */
+			if (e && e.message && /已丢弃|下载被截断|解析失败/.test(e.message))
+				throw e;
+
+			return fs.remove(tmp).catch(function() {})
+				.then(function() { return fs.remove(tmpJson).catch(function() {}); })
+				.then(function() { throw e; });
+		});
+};
+
+/*
+ * 更新一个规则集：下载 → 校验 → 备份旧文件 → 原子替换。
+ * 任何一步失败都不会动到正在使用的文件。
+ */
+api.updateRuleSet = function(tag) {
+	var spec = RULESET_SOURCES[tag];
+
+	if (!spec)
+		return Promise.reject(new Error(_('这个规则集不支持自动更新')));
+
+	var dst = api.ruleSetPath(tag);
+	var tmp = dst + '.tmp';
+	var bak = dst + '.bak';
+
+	return api.downloadRuleSet(tag, tmp).then(function(dl) {
+		return api.validateRuleSet(tag, tmp).then(function(v) {
+			v.url = dl.url;
+
+			/* 备份旧文件（不存在也无所谓） */
+			return api.exec('/bin/mv', [ dst, bak ]).catch(function() { return null; })
+				.then(function() { return v; });
+		});
+	}).then(function(v) {
+		return api.exec('/bin/mv', [ tmp, dst ]).then(function(res) {
+			if (res.code !== 0) {
+				/* 装不进去就把备份恢复回来 */
+				return api.exec('/bin/mv', [ bak, dst ]).catch(function() { return null; })
+					.then(function() {
+						throw new Error(_('替换文件失败') + '：' + core.trimStr(res.stderr || res.stdout));
+					});
+			}
+
+			return v;
+		});
+	}).then(function(v) {
+		return { tag: tag, size: v.size, rules: v.rules, url: v.url, path: dst };
+	}).catch(function(e) {
+		/* 兜底清理，避免留下 .tmp */
+		return fs.remove(tmp).catch(function() {}).then(function() { throw e; });
+	});
 };
 
 /* 同 core：必须导出 class，LuCI 会 new 它 */

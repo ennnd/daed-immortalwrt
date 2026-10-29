@@ -8,7 +8,7 @@
 				"/etc/sing-box/subscriptions.json": [ "read" ],
 				"/etc/sing-box/backup": [ "list" ],
 				"/etc/sing-box/backup/*": [ "read" ],
-				"/etc/sing-box/rule-set/*": [ "list" ],
+				"/etc/sing-box/rule-set/*": [ "list", "read" ],
 				"/rom/etc/sing-box/config.json": [ "read" ],
 				"/tmp/luci-singbox-sub.txt": [ "read" ]
 			},

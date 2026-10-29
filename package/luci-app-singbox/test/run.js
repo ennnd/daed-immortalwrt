@@ -436,6 +436,54 @@ ok('isPrivateIp 223.5.5.5 是公网', core.isPrivateIp('223.5.5.5') === false);
 ok('isPrivateIp 119.29.29.29 是公网', core.isPrivateIp('119.29.29.29') === false);
 ok('isPrivateIp 域名保守当作会绕过', core.isPrivateIp('dns.example.com') === true);
 
+/* ---------- DNS 地址 / 协议解析 ---------- */
+ok('DNS_PROTOCOLS 含 DoT', core.DNS_PROTOCOLS.some(p => p.value === 'tls'));
+ok('DNS_PROTOCOLS 含 DoH/DoQ/DoH3', [ 'https', 'quic', 'h3' ].every(v => core.DNS_PROTOCOLS.some(p => p.value === v)));
+ok('DNS_PROTOCOLS 不含 dhcp（本 build 未编译）', !core.DNS_PROTOCOLS.some(p => p.value === 'dhcp'));
+ok('dnsProtocolInfo(DoT) 默认端口 853', core.dnsProtocolInfo('tls').defaultPort === 853);
+ok('dnsProtocolInfo(DoH) 默认端口 443', core.dnsProtocolInfo('https').defaultPort === 443);
+ok('dnsProtocolInfo(UDP) 默认端口 53', core.dnsProtocolInfo('udp').defaultPort === 53);
+ok('dnsProtocolLabel 返回可读名', /DoT/.test(core.dnsProtocolLabel('tls')));
+
+let ep = core.parseDnsEndpoint('223.5.5.5');
+ok('parseDnsEndpoint 裸 IPv4', ep.server === '223.5.5.5' && ep.port === null);
+ep = core.parseDnsEndpoint('1.1.1.1:853');
+ok('parseDnsEndpoint IPv4:端口', ep.server === '1.1.1.1' && ep.port === 853);
+ep = core.parseDnsEndpoint('dns.google');
+ok('parseDnsEndpoint 域名', ep.server === 'dns.google' && ep.port === null);
+ep = core.parseDnsEndpoint('dns.google:853');
+ok('parseDnsEndpoint 域名:端口', ep.server === 'dns.google' && ep.port === 853);
+ep = core.parseDnsEndpoint('[2606:4700:4700::1111]:853');
+ok('parseDnsEndpoint [IPv6]:端口', ep.server === '2606:4700:4700::1111' && ep.port === 853);
+ep = core.parseDnsEndpoint('2606:4700:4700::1111');
+ok('parseDnsEndpoint 裸 IPv6 不当成 host:port', ep.server === '2606:4700:4700::1111' && ep.port === null);
+ep = core.parseDnsEndpoint('  ');
+ok('parseDnsEndpoint 空串报错', ep.error === 'empty');
+ep = core.parseDnsEndpoint('1.1.1.1:99999');
+ok('parseDnsEndpoint 端口越界报错', ep.error === 'bad-port');
+ep = core.parseDnsEndpoint('https://1.1.1.1/dns-query');
+ok('parseDnsEndpoint 拒绝 URL', !!ep.error);
+ep = core.parseDnsEndpoint('localhost');
+ok('parseDnsEndpoint 拒绝无点单标签', ep.error === 'bad-server');
+
+let entry = core.applyDnsEndpoint({ tag: 'dns_cn', type: 'udp', server: 'x' }, 'tls', { server: '223.5.5.5', port: 853 });
+ok('applyDnsEndpoint 写入 type/server_port', entry.type === 'tls' && entry.server === '223.5.5.5' && entry.server_port === 853);
+entry = core.applyDnsEndpoint({ tag: 'dns_cn', type: 'tls', server: 'x', server_port: 853 }, 'udp', { server: '223.5.5.5', port: null });
+ok('applyDnsEndpoint 端口为空时删掉 server_port', !('server_port' in entry) && entry.type === 'udp');
+
+/* ---------- rule-set 内容校验 ---------- */
+ok('validateRuleSetJson 接受正常结构',
+	core.validateRuleSetJson('{"version":1,"rules":[{"ip_cidr":["1.0.1.0/24"]}]}').rules === 1);
+ok('validateRuleSetJson 拒绝空 rules',
+	core.validateRuleSetJson('{"version":1,"rules":[]}').error === 'no-rules');
+ok('validateRuleSetJson 拒绝坏 JSON',
+	core.validateRuleSetJson('<html>404</html>').error === 'bad-json');
+ok('validateRuleSetJson 拒绝缺 rules',
+	core.validateRuleSetJson('{"version":1}').error === 'no-rules');
+ok('ruleSetMatchHit 命中', core.ruleSetMatchHit('match rules.[0]: ip_cidr=<binary>') === true);
+ok('ruleSetMatchHit 未命中（空输出）', core.ruleSetMatchHit('') === false);
+ok('ruleSetMatchHit 不把 mismatch 当命中', core.ruleSetMatchHit('mismatch something') === false);
+
 /* ---------- 6. 产出样例配置给 sing-box check 用 ---------- */
 
 const samplePath = process.env.SINGBOX_SAMPLE || path.join(require('os').tmpdir(), 'luci-singbox-sample.json');

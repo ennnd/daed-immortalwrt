@@ -82,6 +82,15 @@ const dirs = { '/etc/sing-box/backup': [
 	{ name: 'config-1700000000.json', size: 6000, type: 'file' },
 	{ name: 'config-1699990000.json', size: 5900, type: 'file' }
 ] };
+/* 让测试可以按需制造各种"下载/校验失败"的场景 */
+const simOpts = {
+	ruleSetTruncated: false,
+	ruleSetNotSrs: false,
+	ruleSetEmptyRules: false,
+	ruleSetInverted: false,
+	ruleSetDownloadFails: false
+};
+
 const calls = [];
 
 const fakeFs = {
@@ -100,6 +109,41 @@ const fakeFs = {
 		if (cmd === '/usr/bin/sing-box' && a[0] === 'check')
 			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
 
+		/* rule-set decompile：结构校验（真实 sing-box 对截断文件报 unexpected EOF） */
+		if (cmd === '/usr/bin/sing-box' && a[0] === 'rule-set' && a[1] === 'decompile') {
+			const src = a[2];
+			const outIdx = a.indexOf('-o');
+			const out = outIdx >= 0 ? a[outIdx + 1] : null;
+
+			if (simOpts.ruleSetTruncated)
+				return Promise.resolve({ code: 1, stdout: '', stderr: 'FATAL[0000] read rule[0]: unexpected EOF' });
+
+			if (simOpts.ruleSetNotSrs)
+				return Promise.resolve({ code: 1, stdout: '', stderr: 'FATAL[0000] invalid sing-box rule-set file' });
+
+			if (!(src in files))
+				return Promise.resolve({ code: 1, stdout: '', stderr: 'FATAL[0000] EOF' });
+
+			if (out) {
+				files[out] = simOpts.ruleSetEmptyRules
+					? JSON.stringify({ version: 1, rules: [] })
+					: JSON.stringify({ version: 1, rules: [ { ip_cidr: [ '1.0.1.0/24' ] }, { domain_suffix: [ 'cn' ] } ] });
+			}
+
+			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+		}
+
+		/* rule-set match：退出码恒为 0，命中与否只能看 stdout 是否以 match 开头 */
+		if (cmd === '/usr/bin/sing-box' && a[0] === 'rule-set' && a[1] === 'match') {
+			const probe = a[a.length - 1];
+			const cnProbes = [ '223.5.5.5', '119.29.29.29', 'baidu.com', 'qq.com' ];
+			const hit = simOpts.ruleSetInverted
+				? !cnProbes.includes(probe)
+				: cnProbes.includes(probe);
+
+			return Promise.resolve({ code: 0, stdout: hit ? 'match rules.[0]: ip_cidr=<binary>\n' : '', stderr: '' });
+		}
+
 		if (/pidof$/.test(cmd))
 			return Promise.resolve({ code: 0, stdout: '1234\n', stderr: '' });
 
@@ -112,7 +156,13 @@ const fakeFs = {
 				'1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n7: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500\n', stderr: '' });
 
 		if (cmd === '/bin/mv') {
-			const [ , , src, dst ] = [ '', '', a[1], a[2] ];
+			/* mv [-f] <src> <dst>：跳过以 - 开头的选项 */
+			const pathArgs = a.filter(x => !/^-/.test(String(x)));
+			const src = pathArgs[0], dst = pathArgs[1];
+
+			if (!(src in files))
+				return Promise.resolve({ code: 1, stdout: '', stderr: "mv: can't stat '" + src + "'" });
+
 			files[dst] = files[src];
 			delete files[src];
 			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
@@ -166,9 +216,17 @@ const fakeFs = {
 
 		if (/uclient-fetch$/.test(cmd)) {
 			const out = a[a.indexOf('-O') + 1];
-			files[out] = /\.srs$/.test(out)
-				? 'x'.repeat(150 * 1024)
-				: fs.readFileSync(path.join(PKG, 'test/fixtures/sub-plain.txt'), 'utf8');
+
+			if (/\.srs/.test(out)) {
+				if (simOpts.ruleSetDownloadFails)
+					return Promise.resolve({ code: 1, stdout: '', stderr: 'Connection timed out' });
+
+				/* SRS\x01 魔数 + 填充；真实 geoip-cn.srs 约 33KB */
+				files[out] = 'SRS\u0001' + 'x'.repeat(simOpts.ruleSetTruncated ? 64 : 34 * 1024);
+				return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+			}
+
+			files[out] = fs.readFileSync(path.join(PKG, 'test/fixtures/sub-plain.txt'), 'utf8');
 			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
 		}
 
@@ -497,6 +555,63 @@ function load(name) {
 	check('applyParsed 不误删已填写的节点', after.outbounds.some(o => o.tag === 'node1'));
 	check('applyParsed 后不再有占位符', core.scanPlaceholders(after).length === 0);
 	check('applyParsed 记录 last_update', nodesView.data.subs.subscriptions[0].count === 6);
+
+	/* ---------- 规则集更新：下载 + 四道校验 ---------- */
+	const RS = '/etc/sing-box/rule-set/geoip-cn.srs';
+
+	/* 先放一个"旧版本"文件，验证失败时不会被覆盖 */
+	files[RS] = 'OLD-VALID-SRS';
+	delete files[RS + '.tmp'];
+	delete files[RS + '.bak'];
+
+	let rsRes = await api.updateRuleSet('geoip-cn');
+	check('updateRuleSet 成功返回大小', rsRes.size > 30 * 1024);
+	check('updateRuleSet 成功返回规则条数', rsRes.rules === 2);
+	check('updateRuleSet 装好了新文件', files[RS] && files[RS].indexOf('SRS') === 0);
+	check('updateRuleSet 把旧文件备份成 .bak', files[RS + '.bak'] === 'OLD-VALID-SRS');
+	check('updateRuleSet 不留 .tmp', !(RS + '.tmp' in files));
+	check('updateRuleSet 不留 .tmp.json', !(RS + '.tmp.json' in files));
+	check('updateRuleSet 走了 decompile 校验',
+		calls.some(c => c[0] === 'exec' && c[1] === '/usr/bin/sing-box' &&
+			c[2] === 'rule-set' && c[3] === 'decompile'));
+	check('updateRuleSet 走了正向探针',
+		calls.some(c => c[0] === 'exec' && c[1] === '/usr/bin/sing-box' &&
+			c[2] === 'rule-set' && c[3] === 'match' && c.indexOf('223.5.5.5') > 0));
+	check('updateRuleSet 走了反向探针',
+		calls.some(c => c[0] === 'exec' && c[1] === '/usr/bin/sing-box' &&
+			c[2] === 'rule-set' && c[3] === 'match' && c.indexOf('8.8.8.8') > 0));
+
+	/* 30KB 的合法文件不该被"小于 100KB"误杀 */
+	check('30KB 级别的合法 srs 不会被体积门槛误删（回归）', rsRes.size < 100 * 1024);
+
+	/* --- 各种失败场景：都必须丢弃临时文件、且不动旧文件 --- */
+	const failCase = async (name, opt, expectRe) => {
+		Object.keys(simOpts).forEach(k => { simOpts[k] = false; });
+		simOpts[opt] = true;
+		files[RS] = 'OLD-VALID-SRS';
+		delete files[RS + '.tmp'];
+		delete files[RS + '.tmp.json'];
+		delete files[RS + '.bak'];
+
+		let err = null;
+		try { await api.updateRuleSet('geoip-cn'); } catch (e) { err = e; }
+
+		check(name + '：被拒绝', !!err);
+		check(name + '：错误信息对口', !!err && expectRe.test(String(err.message)), err && err.message);
+		check(name + '：旧文件原样保留', files[RS] === 'OLD-VALID-SRS');
+		check(name + '：没留下 .tmp', !(RS + '.tmp' in files));
+		check(name + '：没留下 .tmp.json', !(RS + '.tmp.json' in files));
+		Object.keys(simOpts).forEach(k => { simOpts[k] = false; });
+	};
+
+	await failCase('下载截断', 'ruleSetTruncated', /不完整|截断/);
+	await failCase('下到错误页', 'ruleSetNotSrs', /不是有效的/);
+	await failCase('规则为空', 'ruleSetEmptyRules', /没有任何规则/);
+	await failCase('内容不对（探针反向）', 'ruleSetInverted', /校验未通过/);
+	await failCase('所有镜像都失败', 'ruleSetDownloadFails', /下载源都失败/);
+
+	check('不支持的 tag 直接拒绝',
+		await api.updateRuleSet('geosite-xx').then(() => false).catch(e => /不支持/.test(String(e.message))));
 
 	const outFile = process.env.SIM_OUT ||
 		path.join(require('os').tmpdir(), 'luci-app-singbox-app-written.json');

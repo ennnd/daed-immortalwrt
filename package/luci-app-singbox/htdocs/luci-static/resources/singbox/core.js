@@ -32,7 +32,7 @@
 
 /* 本包的构建版本号。任何改动本包前端文件后都应递增，
    这样浏览器缓存的旧文件能被检测出来。 */
-var BUILD_ID = '2026-10-29.3';
+var BUILD_ID = '2026-10-29.4';
 
 var VER_PATH = '/luci-static/resources/singbox/core.ver.js';
 
@@ -1780,11 +1780,165 @@ function isPrivateIp(s) {
 	return false;
 }
 
+/* ===================================================================
+ * DNS 服务器地址 / 协议
+ * =================================================================== */
+
+/*
+ * sing-box 1.12+ 的 DNS server 写法是 "type" + "server" + "server_port"。
+ * 本配置里会用到这几种（都在 sing-box 1.14.3 上实测可用）：
+ *   udp   → 明文 UDP/53
+ *   tcp   → 明文 TCP/53
+ *   tls   → DoT，默认 853
+ *   https → DoH，默认 443
+ *   quic  → DoQ，默认 853（UDP）
+ *   h3    → DoH over HTTP/3，默认 443
+ * dhcp 在本固件（diet build）里未编译，所以不提供。
+ */
+var DNS_PROTOCOLS = [
+	{ value: 'udp',   label: 'UDP（明文 53）',      defaultPort: 53  },
+	{ value: 'tcp',   label: 'TCP（明文 53）',      defaultPort: 53  },
+	{ value: 'tls',   label: 'DoT（TLS 853）',      defaultPort: 853 },
+	{ value: 'https', label: 'DoH（HTTPS 443）',    defaultPort: 443 },
+	{ value: 'quic',  label: 'DoQ（QUIC 853）',     defaultPort: 853 },
+	{ value: 'h3',    label: 'DoH3（HTTP/3 443）',  defaultPort: 443 }
+];
+
+function dnsProtocolInfo(type) {
+	for (var i = 0; i < DNS_PROTOCOLS.length; i++) {
+		if (DNS_PROTOCOLS[i].value === type)
+			return DNS_PROTOCOLS[i];
+	}
+
+	return null;
+}
+
+function dnsProtocolLabel(type) {
+	var p = dnsProtocolInfo(type);
+
+	return p ? p.label : String(type || '?');
+}
+
+/*
+ * 解析用户填的 DNS 地址，支持：
+ *   223.5.5.5
+ *   1.1.1.1:853
+ *   dns.google
+ *   dns.google:853
+ *   [2606:4700:4700::1111]:853     ← IPv6 必须带方括号才能和端口区分
+ *   2606:4700:4700::1111           ← 裸 IPv6，不带端口
+ *
+ * 返回 { server, port } 或 { error }。
+ * port 为 null 表示"用该协议的默认端口"（由 sing-box 自己决定，不写 server_port）。
+ */
+function parseDnsEndpoint(input) {
+	var s = trimStr(input);
+
+	if (!s)
+		return { error: 'empty' };
+
+	var server = s, port = null;
+
+	/* [IPv6]:port 或 [IPv6] */
+	var m6 = /^\[([0-9a-fA-F:.]+)\](?::(\d{1,5}))?$/.exec(s);
+
+	if (m6) {
+		server = m6[1];
+		if (m6[2] != null)
+			port = parseInt(m6[2], 10);
+	}
+	else if (s.indexOf(':') >= 0 && s.indexOf(':') === s.lastIndexOf(':')) {
+		/* 只有一个冒号 → host:port（裸 IPv6 会有多个冒号，落到 else） */
+		var parts = s.split(':');
+		server = parts[0];
+		port = parseInt(parts[1], 10);
+	}
+
+	if (!server)
+		return { error: 'empty' };
+
+	if (port != null && (!isFinite(port) || port < 1 || port > 65535))
+		return { error: 'bad-port' };
+
+	/* 粗校验：只允许 IP 字面量、域名，避免把 URL 误填进来 */
+	if (!/^[0-9a-fA-F:.]+$/.test(server) && !/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(server))
+		return { error: 'bad-server' };
+
+	if (/^[A-Za-z]/.test(server) && server.indexOf('.') < 0)
+		return { error: 'bad-server' };
+
+	return { server: server, port: port };
+}
+
+/* 把解析结果写回一个 dns.servers 条目（不改 tag/detour） */
+function applyDnsEndpoint(entry, type, endpoint) {
+	if (endpoint && endpoint.error)
+		return entry;
+
+	entry.type = type;
+
+	if (endpoint && endpoint.server)
+		entry.server = endpoint.server;
+
+	if (endpoint && endpoint.port != null) {
+		entry.server_port = endpoint.port;
+	}
+	else {
+		delete entry.server_port;
+	}
+
+	return entry;
+}
+
+/* ===================================================================
+ * rule-set 文件校验
+ * =================================================================== */
+
+/*
+ * 一个 .srs 文件"完整"意味着什么：
+ *   1. 前 4 字节魔数是 "SRS\x01"（sing-box 私有二进制格式）
+ *   2. 整个 protobuf 能解出来 —— 截断的文件会在中途 EOF
+ *   3. 解出来至少有一条 rule
+ *
+ * 真实大小参考（SagerNet rule-set 分支，2026-10）：
+ *   geoip-cn.srs   ≈ 33 KB
+ *   geosite-cn.srs ≈ 55 KB
+ * 所以**绝对不能**用"小于 100KB 判失败"这种门槛 —— 会把两个合法文件都删掉。
+ * 正确的做法是做结构校验 + 语义探针（见 api.updateRuleSet）。
+ */
+
+/* 结构校验：只判断 decompile 出来的 JSON 是否像一个 rule-set */
+function validateRuleSetJson(text) {
+	var obj;
+
+	try {
+		obj = JSON.parse(String(text || ''));
+	}
+	catch (e) {
+		return { ok: false, error: 'bad-json' };
+	}
+
+	if (!obj || typeof obj !== 'object')
+		return { ok: false, error: 'bad-json' };
+
+	if (!Array.isArray(obj.rules) || obj.rules.length === 0)
+		return { ok: false, error: 'no-rules' };
+
+	return { ok: true, version: obj.version, rules: obj.rules.length };
+}
+
+/* 判断 `sing-box rule-set match` 的输出是否表示"命中"。
+   注意：无论命中与否，退出码都是 0，只能看 stdout 是否以 "match" 开头。 */
+function ruleSetMatchHit(stdout) {
+	var s = String(stdout || '').trim();
+
+	return s.length > 0 && /^match(\s|$)/i.test(s);
+}
+
 /*
  * 必须 return 一个 class：LuCI 的 require() 会 new 它再返回实例，
  * 直接 return 普通对象会报 "factory yields invalid constructor"。
- */
-return baseclass.extend({
+ */return baseclass.extend({
 	trimStr: trimStr,
 	b64ToBytes: b64ToBytes,
 	utf8Decode: utf8Decode,
@@ -1831,6 +1985,13 @@ return baseclass.extend({
 	uciIpv6BlockStatus: uciIpv6BlockStatus,
 	ipv6ProblemText: ipv6ProblemText,
 	isPrivateIp: isPrivateIp,
+	DNS_PROTOCOLS: DNS_PROTOCOLS,
+	dnsProtocolInfo: dnsProtocolInfo,
+	dnsProtocolLabel: dnsProtocolLabel,
+	parseDnsEndpoint: parseDnsEndpoint,
+	applyDnsEndpoint: applyDnsEndpoint,
+	validateRuleSetJson: validateRuleSetJson,
+	ruleSetMatchHit: ruleSetMatchHit,
 	BUILD_ID: BUILD_ID,
 	VER_PATH: VER_PATH,
 	fetchServerBuildId: fetchServerBuildId,
