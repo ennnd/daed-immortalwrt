@@ -14,7 +14,7 @@ staged=$(git diff --cached --name-only --diff-filter=ACM)
 for f in $staged; do
 	# 1) 按路径拦截：这些文件属于“设备本地状态”，不该入库
 	case "$f" in
-		*/subscription.url|*/subscription.filter|*/nodes.json)
+		*/subscription.url|*/subscription.filter|*/nodes.json|*/dead-nodes)
 			echo "pre-commit: 拒绝提交 $f（订阅凭证只放设备上，不入库）" >&2
 			fail=1
 			continue

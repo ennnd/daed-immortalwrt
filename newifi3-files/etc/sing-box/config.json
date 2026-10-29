@@ -277,6 +277,11 @@
     "auto_detect_interface": true
   },
   "experimental": {
+    // 本地 Clash API：只监听 127.0.0.1，供 singbox-nodecheck 逐节点测延迟用。
+    // 不要把地址改成 0.0.0.0 —— 那等于把节点控制和测速接口暴露给整个局域网。
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090"
+    },
     "cache_file": {
       "enabled": true,
       // 1.14：DNS 缓存落盘用 store_dns（store_rdrc 已弃用，1.16 移除）。

@@ -12,3 +12,4 @@ newifi3-files/etc/sing-box/rule-set/
 *.bak
 *.tmp
 *.old
+newifi3-files/etc/sing-box/dead-nodes

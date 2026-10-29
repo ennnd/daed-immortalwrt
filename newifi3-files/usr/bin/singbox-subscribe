@@ -355,6 +355,30 @@ done < "$nodes"
 total=$(wc -l < "$filtered" | tr -d ' ')
 [ "$total" -gt 0 ] || die "筛选后没有节点（保留规则: ${keep_re:-无}，排除: ${excl_re:-无}）"
 
+# 跳过 nodecheck 近期判定为坏的节点（TTL 内不复活），否则每次刷新都会把刚踢掉的装回来
+DEADF=/etc/sing-box/dead-nodes
+if [ -s "$DEADF" ]; then
+	now=$(date +%s)
+	awk -F'\t' -v ttl=21600 -v now="$now" 'NF==2 && (now - $2) < ttl { print $1 }' "$DEADF" > "$WORK/dead.txt"
+	if [ -s "$WORK/dead.txt" ]; then
+		: > "$filtered.alive"
+		while IFS= read -r line; do
+			t=$(printf '%s' "$line" | jq -r '.tag // ""' 2>/dev/null)
+			if grep -qxF "$t" "$WORK/dead.txt"; then
+				n_drop=$((n_drop + 1))
+			else
+				printf '%s\n' "$line" >> "$filtered.alive"
+			fi
+		done < "$filtered"
+		if [ -s "$filtered.alive" ]; then
+			mv "$filtered.alive" "$filtered"
+			total=$(wc -l < "$filtered" | tr -d ' ')
+		fi
+	fi
+fi
+
+[ "$total" -gt 0 ] || die "所有节点都在 dead-nodes 名单里（TTL 6 小时），本次不更新"
+
 # 超过上限则截断（顺序即订阅顺序，机场通常把好节点排前面）
 if [ "$total" -gt "$MAX_NODES" ]; then
 	head -n "$MAX_NODES" "$filtered" > "$filtered.tmp" && mv "$filtered.tmp" "$filtered"
@@ -396,23 +420,25 @@ jq '
 ' "$WORK/nodes.json" > "$WORK/outbounds.json" || die "生成 outbounds 失败"
 
 # 去掉最外层 [ ]，其余缩进正好落进 config 的 outbounds 数组（补 2 空格对齐）
-jq . "$WORK/outbounds.json" | sed '1d;$d' | sed 's/^/  /' > "$WORK/ob.txt"
-
-grep -q '>>> NODES BEGIN' "$CONF" || die "配置里缺少标记 // >>> NODES BEGIN，无法安全替换（请先给 outbounds 加标记）"
-grep -q '<<< NODES END' "$CONF" || die "配置里缺少标记 // <<< NODES END"
+jq . < "$WORK/outbounds.json" | sed '1d;$d' | sed 's/^/  /' > "$WORK/ob.txt"
 
 # 拼接：标记前 + 新节点 + 标记后
-sed -n '1,/>>> NODES BEGIN/p' "$CONF" > "$WORK/config.new"
-cat "$WORK/ob.txt" >> "$WORK/config.new"
-sed -n '/<<< NODES END/,$p' "$CONF" >> "$WORK/config.new"
+# 标记可能不存在 —— LuCI 面板保存配置时会重新序列化 JSON，注释（含标记）会丢。
+# 那种情况下退化成“整体重写 outbounds”，功能等价，只是注释没了。
+if grep -q '>>> NODES BEGIN' "$CONF" && grep -q '<<< NODES END' "$CONF"; then
+	sed -n '1,/>>> NODES BEGIN/p' "$CONF" > "$WORK/config.new"
+	cat "$WORK/ob.txt" >> "$WORK/config.new"
+	sed -n '/<<< NODES END/,$p' "$CONF" >> "$WORK/config.new"
+else
+	sed '/^[[:space:]]*\/\//d' "$CONF" > "$WORK/conf.json" || die "读取配置失败"
+	jq --slurpfile ob "$WORK/outbounds.json" '.outbounds = $ob[0]' "$WORK/conf.json" > "$WORK/config.new" \
+		|| die "重写配置失败"
+fi
 
 # 节点完全没变就不重启，避免每 6 小时把连接打断一次。
-# 判据是“配置里现有那段”和“新生成那段”的哈希，不依赖外部状态文件 ——
-# 用独立状态文件出过问题：中途用测试配置跑过一次，状态被写成新哈希，
-# 而线上配置其实没变，于是真正更新时被误判成“无变化”直接跳过。
-new_md5=$(md5sum < "$WORK/ob.txt" | cut -d' ' -f1)
-cur_md5=$(sed -n '/>>> NODES BEGIN/,/<<< NODES END/p' "$CONF" \
-	| grep -v 'NODES BEGIN\|NODES END' | md5sum | cut -d' ' -f1)
+# 比的是“规范化后的 outbounds 数组”哈希，两种拼接方式都适用。
+new_md5=$(jq -c . "$WORK/outbounds.json" | md5sum | cut -d' ' -f1)
+cur_md5=$(sed '/^[[:space:]]*\/\//d' "$CONF" | jq -c '.outbounds' 2>/dev/null | md5sum | cut -d' ' -f1)
 if [ "$new_md5" = "$cur_md5" ]; then
 	log "节点无变化（$total 个），跳过重启"
 	exit 0

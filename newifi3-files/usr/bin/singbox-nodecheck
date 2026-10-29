@@ -1,0 +1,199 @@
+#!/bin/sh
+# singbox-nodecheck —— 逐个节点做真实探测，踢掉连不上的，必要时触发订阅刷新
+#
+# 为什么需要它：
+#   urltest 只会在“选路”时避开坏节点，坏节点本身仍留在配置里；
+#   当机场大面积挂掉时，selector 可能已经没得选，表现为“能上国内、上不了国外”。
+#   看门狗负责“整体不可用时退回直连”，本脚本负责“在退化成那样之前先清理节点”。
+#
+# 判据来源：
+#   sing-box 的 clash_api（只监听 127.0.0.1:9090）。对每个节点调用
+#   GET /proxies/<name>/delay?url=...&timeout=4000 —— 这是让 sing-box 用该节点
+#   真正发一次 HTTPS 请求，比“看进程在不在”“看端口通不通”可靠得多。
+#
+# 动作：
+#   1. 测出失败节点 -> 记入 /etc/sing-box/dead-nodes（tag + 时间戳）
+#   2. 把失败节点从配置里删掉（保留其余节点与设置），重启并实测连通性；
+#      实测不过则回滚（配置改对了但节点全废的情况不能让它上网变砖）
+#   3. 存活节点 <= 1 时，调用 singbox-subscribe 重新拉订阅
+#      （订阅那边会跳过 dead-nodes 里 TTL 内的节点，避免把刚踢掉的又装回来）
+#
+# 用法：singbox-nodecheck [-n]   -n 只检测不修改
+
+set -u
+
+CONF=${SINGBOX_SUB_CONF:-/etc/sing-box/config.json}
+API=http://127.0.0.1:9090
+DEAD=/etc/sing-box/dead-nodes
+WORK=/tmp/sb-nodecheck
+TAG=singbox-nodecheck
+DELAY_TIMEOUT=4000
+DEAD_TTL=21600          # 6 小时内不再复活同一个坏节点
+MIN_ALIVE=1             # 存活 <= 这个数就触发订阅刷新
+
+DRY=0
+[ "${1:-}" = "-n" ] && DRY=1
+
+log() { logger -t "$TAG" "$*"; echo "$*"; }
+die() { logger -t "$TAG" "ERROR: $*"; echo "ERROR: $*" >&2; exit 1; }
+
+pidof sing-box >/dev/null 2>&1 || { echo "sing-box 未运行，跳过"; exit 0; }
+
+# 防止与 singbox-subscribe 同时重启 sing-box
+LOCKD=/tmp/.sb_nodecheck.lock
+if ! mkdir "$LOCKD" 2>/dev/null; then
+	age=$(( $(date +%s) - $(date -r "$LOCKD" +%s 2>/dev/null || echo 0) ))
+	if [ "$age" -gt 600 ]; then
+		rm -rf "$LOCKD"; mkdir "$LOCKD" 2>/dev/null || exit 0
+	else
+		echo "已有实例在运行，跳过"; exit 0
+	fi
+fi
+trap 'rm -rf "$LOCKD"' EXIT INT TERM
+
+rm -rf "$WORK"; mkdir -p "$WORK"
+
+# ---------------------------------------------------------------- 取节点列表
+uclient-fetch -q -O "$WORK/px.json" -T 6 "$API/proxies" 2>/dev/null \
+	|| die "读不到 clash_api（配置里 experimental.clash_api 是否启用？）"
+
+jq -r '.proxies | to_entries[]
+	| select((.value.type|ascii_downcase) as $t
+	         | ["vless","trojan","shadowsocks","vmess","hysteria2","tuic"] | index($t))
+	| .key' < "$WORK/px.json" > "$WORK/nodes.txt" 2>/dev/null
+
+total=$(wc -l < "$WORK/nodes.txt" | tr -d ' ')
+[ "$total" -gt 0 ] || { echo "没有可检测的节点"; exit 0; }
+
+# ---------------------------------------------------------------- 逐节点探测
+alive=0
+: > "$WORK/dead.txt"
+now=$(date +%s)
+
+while IFS= read -r tag; do
+	enc=$(printf '%s' "$tag" | jq -Rr '@uri')
+	url="$API/proxies/${enc}/delay?url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=${DELAY_TIMEOUT}"
+
+	res=$(uclient-fetch -q -O - -T 8 "$url" 2>/dev/null)
+	delay=$(printf '%s' "$res" | jq -r '.delay // empty' 2>/dev/null)
+
+	if [ -z "$delay" ]; then
+		# 掉线常伴随网络抖动，隔 2 秒再确认一次，避免把偶然超时当故障
+		sleep 2
+		res=$(uclient-fetch -q -O - -T 8 "$url" 2>/dev/null)
+		delay=$(printf '%s' "$res" | jq -r '.delay // empty' 2>/dev/null)
+	fi
+
+	if [ -n "$delay" ]; then
+		alive=$((alive + 1))
+		printf '  %-50s %sms\n' "$(printf '%s' "$tag" | sed 's/.*@//')" "$delay"
+	else
+		printf '  %-50s DEAD\n' "$(printf '%s' "$tag" | sed 's/.*@//')"
+		printf '%s\n' "$tag" >> "$WORK/dead.txt"
+		printf '%s\t%s\n' "$tag" "$now" >> "$DEAD"
+	fi
+done < "$WORK/nodes.txt"
+
+dead_n=$(wc -l < "$WORK/dead.txt" | tr -d ' ')
+log "检测 $total 个节点：存活 $alive，失败 $dead_n"
+
+[ "$dead_n" -gt 0 ] || exit 0
+[ "$DRY" = "1" ] && { echo "dry-run：不修改配置"; exit 0; }
+
+# 清理过期的 dead 记录，避免文件无限长
+if [ -f "$DEAD" ]; then
+	awk -F'\t' -v ttl="$DEAD_TTL" -v now="$now" 'NF==2 && (now - $2) < ttl' "$DEAD" > "$DEAD.tmp" \
+		&& mv "$DEAD.tmp" "$DEAD"
+fi
+
+# 全灭就不动配置了：删干净等于 0 个节点，sing-box 起不来，
+# 这种情况交给看门狗退回直连，同时尝试刷订阅。
+if [ "$alive" -eq 0 ]; then
+	log "所有节点均不可用，尝试刷新订阅"
+	[ "$alive" -le "$MIN_ALIVE" ] && /usr/bin/singbox-subscribe 2>&1 | tail -3
+	exit 0
+fi
+
+# ---------------------------------------------------------------- 重建 outbounds
+# 用 jq 从现有配置里取节点，剔除 dead，再重排 selector/urltest/direct
+# 两个坑：
+#   1) dead.txt 是裸文本行，必须用 --rawfile 再 split；--slurpfile 要求每行是 JSON
+#   2) 这个 jq 直接吃文件名偶发断言失败（cb == jq_util_input_next_input_cb），
+#      统一改成从 stdin 喂
+sed '/^[[:space:]]*\/\//d' "$CONF" > "$WORK/conf.json" || die "读取配置失败"
+
+jq --rawfile deadraw "$WORK/dead.txt" '
+	($deadraw | split("\n") | map(select(length > 0))) as $dead
+	| [ .outbounds[]
+	    | select((.type|ascii_downcase) as $t
+	             | ["vless","trojan","shadowsocks","vmess","hysteria2","tuic"] | index($t))
+	    | select(.tag as $tag | ($dead | index($tag)) == null) ]
+' < "$WORK/conf.json" > "$WORK/nodes.json" 2>/dev/null || die "解析现有节点失败"
+
+kept=$(jq 'length' < "$WORK/nodes.json")
+[ "$kept" -gt 0 ] || die "剔除后没有剩余节点，放弃修改"
+
+jq '
+	(map(.tag)) as $tags
+	| [ { type: "selector", tag: "proxy", outbounds: (["auto"] + $tags), default: "auto" },
+	    { type: "urltest", tag: "auto", outbounds: $tags,
+	      url: "https://cp.cloudflare.com/generate_204", interval: "3m", tolerance: 50 },
+	    { type: "direct", tag: "direct", reuse_addr: true } ] + .
+' "$WORK/nodes.json" > "$WORK/outbounds.json" || die "生成 outbounds 失败"
+
+jq . < "$WORK/outbounds.json" | sed '1d;$d' | sed 's/^/  /' > "$WORK/ob.txt"
+
+# 有标记就只替换标记段（保留注释）；没有标记（面板保存过配置后注释会丢）就整体重写
+if grep -q '>>> NODES BEGIN' "$CONF" && grep -q '<<< NODES END' "$CONF"; then
+	sed -n '1,/>>> NODES BEGIN/p' "$CONF" > "$WORK/config.new"
+	cat "$WORK/ob.txt" >> "$WORK/config.new"
+	sed -n '/<<< NODES END/,$p' "$CONF" >> "$WORK/config.new"
+else
+	jq --slurpfile ob "$WORK/outbounds.json" '.outbounds = $ob[0]' "$WORK/conf.json" > "$WORK/config.new" \
+		|| die "重写配置失败"
+fi
+
+sing-box check -c "$WORK/config.new" >/dev/null 2>&1 || die "新配置校验失败，放弃修改"
+
+cp "$CONF" "$CONF.bak.nodecheck"
+cp "$WORK/config.new" "$CONF"
+
+rm -f /tmp/.sb_wd_seen
+/etc/init.d/sing-box restart >/dev/null 2>&1
+sleep 5
+
+# 连续观察 6 秒，崩溃循环时 pid 会一闪而过
+i=0
+while [ "$i" -lt 6 ]; do
+	pidof sing-box >/dev/null 2>&1 || break
+	sleep 1; i=$((i + 1))
+done
+
+ok=1
+pidof sing-box >/dev/null 2>&1 || ok=0
+if [ "$ok" = "1" ]; then
+	i=0
+	ok=0
+	while [ "$i" -lt 4 ]; do
+		out=$(wget -O /dev/null -T 8 https://cp.cloudflare.com/generate_204 2>&1)
+		case "$out" in *"0 bytes"*) ok=1; break ;; esac
+		sleep 4; i=$((i + 1))
+	done
+fi
+
+if [ "$ok" = "0" ]; then
+	cp "$CONF.bak.nodecheck" "$CONF"
+	/etc/init.d/sing-box restart >/dev/null 2>&1
+	rm -f /tmp/.sb_wd_seen
+	die "剔除后实测不通，已回滚（存活 $alive，剔除 $dead_n）"
+fi
+
+log "已剔除 $dead_n 个节点，保留 $kept 个，连通性正常"
+
+# 只剩一个（或更少）能用的，说明这批节点基本废了，去拉新订阅
+if [ "$alive" -le "$MIN_ALIVE" ]; then
+	log "存活节点仅 $alive 个，触发订阅更新"
+	/usr/bin/singbox-subscribe 2>&1 | tail -3
+fi
+
+exit 0

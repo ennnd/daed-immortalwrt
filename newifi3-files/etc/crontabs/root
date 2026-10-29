@@ -2,3 +2,5 @@
 */2 * * * * /usr/bin/singbox-watchdog
 # sing-box 订阅：每 6 小时拉一次节点，节点有变化才重启
 17 */6 * * * /usr/bin/singbox-subscribe
+# 节点健康检查：每 10 分钟逐节点实测，坏节点自动剔除；只剩 1 个可用时触发订阅刷新
+*/10 * * * * /usr/bin/singbox-nodecheck

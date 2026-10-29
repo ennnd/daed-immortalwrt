@@ -12,7 +12,7 @@ CFG=/etc/sing-box/config.json
 # cron 调用非可执行文件时只会往 syslog 写一条 cron.err，看门狗就此静默失效，
 # 热插拔脚本同理（iface 事件直接不触发）。每次启用时顺手补回。
 chmod 755 /usr/bin/singbox-on /usr/bin/singbox-off /usr/bin/singbox-safestop \
-          /usr/bin/singbox-watchdog /usr/bin/singbox-subscribe \
+          /usr/bin/singbox-watchdog /usr/bin/singbox-subscribe /usr/bin/singbox-nodecheck \
           /etc/hotplug.d/iface/99-singbox 2>/dev/null || true
 
 if grep -q '"YOUR_' "$CFG"; then
