@@ -29,13 +29,13 @@ if [ -z "$f" ]; then
 fi
 uci commit firewall
 
-# 启用 cron，使 sing-box 每日定时停止（安全网）生效；并保底写入 crontab 条目
+# 启用 cron，安装 sing-box watchdog（每 2 分钟检测国外站点，代理连不上国外但国内正常时自动停止 sing-box）
 if [ -x /etc/init.d/cron ]; then
-  grep -q 'singbox-safestop' /etc/crontabs/root 2>/dev/null || cat >> /etc/crontabs/root <<'CRON'
-
-# sing-box safety auto-stop: daily revert to direct internet so LAN is never stuck offline
-30 6 * * * /usr/bin/singbox-safestop
+  cat > /etc/crontabs/root <<'CRON'
+# sing-box watchdog: 每 2 分钟检测 baidu.com 可达性，不可达则自动停止 sing-box 并恢复直连
+*/2 * * * * /usr/bin/singbox-watchdog
 CRON
   /etc/init.d/cron enable 2>/dev/null
+  /etc/init.d/cron restart 2>/dev/null
 fi
 exit 0

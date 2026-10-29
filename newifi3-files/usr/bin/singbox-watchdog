@@ -1,0 +1,71 @@
+#!/bin/sh
+# sing-box watchdog
+# 核心目的：检测“代理是否真的能通国外站点”——这才是 sing-box 存在的意义。
+# 注意：baidu.com 在你的配置里属于 geosite-cn/geoip-cn 规则，走直连，根本不经过代理，
+#       所以单测 baidu 无法发现“代理连不上国外”的故障。这里以国外站点为真正判据。
+#
+# 判定逻辑：
+#   1) 国外(google)可达            -> 代理正常，保持运行。
+#   2) 国外不可达 但 国内(baidu)可达 -> 说明是代理节点连不上国外，停止 sing-box 并恢复直连
+#                                      （至少保住国内网络），避免 LAN 卡在“伪在线”。
+#   3) 国内国外都不可达             -> 整条上行故障，停代理无意义，保持运行等待恢复（避免抖动）。
+#
+# 仅当 sing-box 正在运行才动作；停止后脚本直接退出，不会自启。
+
+TAG=singbox-watchdog
+STATE=/tmp/.sb_wd_seen
+GRACE=90            # sing-box 启动后宽限期（秒），避免启动未完成就误判
+TRIES=3
+PAUSE=8             # 每次探测间隔（秒）
+
+pid=$(pidof sing-box)
+if [ -z "$pid" ]; then
+    rm -f "$STATE"
+    exit 0
+fi
+
+now=$(date +%s)
+if [ -f "$STATE" ]; then
+    seen=$(cat "$STATE" 2>/dev/null)
+else
+    echo "$now" > "$STATE"
+    seen=$now
+fi
+if [ $((now - seen)) -lt "$GRACE" ]; then
+    exit 0
+fi
+
+reach() {
+    wget -q -T 8 -O /dev/null "$1" 2>/dev/null
+}
+
+# 1) 先测国外（这才考验代理）
+foreign_ok=0
+i=1
+while [ "$i" -le "$TRIES" ]; do
+    if reach https://www.google.com; then foreign_ok=1; break; fi
+    sleep "$PAUSE"
+    i=$((i + 1))
+done
+
+if [ "$foreign_ok" = "1" ]; then
+    logger -t "$TAG" "foreign reachable, sing-box OK"
+    exit 0
+fi
+
+# 2) 国外失败 -> 用国内做对照，区分“代理坏”还是“整条上行坏”
+domestic_ok=0
+i=1
+while [ "$i" -le "$TRIES" ]; do
+    if reach http://www.baidu.com; then domestic_ok=1; break; fi
+    sleep "$PAUSE"
+    i=$((i + 1))
+done
+
+if [ "$domestic_ok" = "1" ]; then
+    logger -t "$TAG" "foreign UNREACHABLE but domestic OK -> proxy broken, stopping sing-box"
+    /usr/bin/singbox-safestop
+else
+    logger -t "$TAG" "both foreign and domestic down -> uplink outage, leave sing-box (avoid flapping)"
+fi
+exit 0
