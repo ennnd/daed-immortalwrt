@@ -6,8 +6,14 @@
 
 return view.extend({
 	load: function() {
-		return Promise.all([ api.status(), api.readText() ]).then(function(r) {
-			return { st: r[0], text: r[1] || '' };
+		return Promise.all([
+			api.status(),
+			api.readText(),
+			/* 顺便检测浏览器是不是在用旧缓存（LuCI 的 ?v= 不随内容变，
+			   热部署后浏览器仍会拿旧 JS）。检测失败不影响主流程。 */
+			core.checkStaleBuild().catch(function() { return { stale: false }; })
+		]).then(function(r) {
+			return { st: r[0], text: r[1] || '', stale: r[2] };
 		});
 	},
 
@@ -50,6 +56,30 @@ return view.extend({
 
 		if (selCard)
 			this.bodyNode.appendChild(selCard);
+
+		/* 缓存检测：LuCI 的 ?v= 固定不变，热部署后浏览器仍会用旧 JS。
+		   检测到不一致就明确告诉用户"你看到的是旧界面"，并给出强制刷新按钮。 */
+		if (data.stale && data.stale.stale) {
+			this.bodyNode.appendChild(E('div', { 'style': 'margin-top:1em' }, [
+				sbui.warn(_('检测到浏览器正在使用旧版本的界面缓存（服务端版本 ') +
+					(data.stale.server || '?') + _('，当前页面版本 ') + core.BUILD_ID + _('）。' +
+					'页面上的判断与提示可能已经过时。请强制刷新后再看。')),
+				E('div', { 'style': 'margin-top:.5em' }, [
+					sbui.btn(_('强制刷新页面'), 'cbi-button-apply', sbui.action(function() {
+						/* 绕过 HTTP 缓存重新加载，并清掉可能已缓存的模块 */
+						try {
+							if (window.caches && window.caches.keys) {
+								window.caches.keys().then(function(keys) {
+									keys.forEach(function(k) { window.caches.delete(k); });
+								});
+							}
+						} catch (e) { /* 忽略 */ }
+
+						window.location.reload(true);
+					}))
+				])
+			]));
+		}
 
 		return E('div', {}, [
 			E('h2', {}, _('Sing-Box')),
@@ -187,7 +217,7 @@ return view.extend({
 		var children = [
 			sbui.kvTable(rows),
 			E('div', { 'style': 'margin-top:1em' }, actions),
-			sbui.hint(_('启用会先建好 singbox 防火墙区（放行 tun0 回程、加上 lan/wan→singbox 转发），' +
+			sbui.hint(_('启用会先建好 singbox 防火墙区（放行 tun0 回程、加上 lan→singbox 转发），' +
 				'再把 dnsmasq 的上游 DNS 指向公网解析器，最后才启动 sing-box。' +
 				'顺序很重要：防火墙必须早于 sing-box（fw4 reload 会冲掉 TUN 规则）。启动失败会自动回滚。'))
 		];

@@ -9,6 +9,75 @@
  * 为什么不用 ucode 写后端：见 NEWIFI3-SINGBOX.md「LuCI 面板」一节。
  */
 
+/*
+ * 缓存自检：LuCI 静态资源的 URL 里的 ?v= 是 LuCI 主版本号（实测是 26），
+ * **不随文件内容变化**。所以我们热部署 / 升级本包后，浏览器仍会继续用
+ * 之前缓存下来的旧 core.js / api.js / overview.js —— 而且 URL 没变，
+ * 连普通刷新都拿不到新文件（只有 Ctrl+F5 强制刷新才行）。
+ *
+ * 结果就是：面板可能显示旧的判断逻辑（比如已经不检查 wan->singbox 了，
+ * 却还在报"缺少 wan→singbox 转发"），用户完全一头雾水。
+ *
+ * 解决办法：把本包的构建版本号（core.js 自身的 BUILD_ID）写进一个可被
+ * 独立获取的地方 —— 这里用一个**独立的小文件** core.ver.js，
+ * 它虽然同样会被缓存，但体积小、且我们在检测时用 cache:'no-store' 绕过缓存，
+ * 从而拿到服务端真实内容。
+ *
+ * 检测流程：
+ *   1. fetch('/luci-static/resources/singbox/core.ver.js', {cache:'no-store'})
+ *      → 拿到服务端真实的 BUILD_ID
+ *   2. 与当前页面运行时的 BUILD_ID（core.js 里的常量）比较
+ *   3. 不一致 → 说明浏览器用的是旧缓存，提示用户强制刷新
+ */
+
+/* 本包的构建版本号。任何改动本包前端文件后都应递增，
+   这样浏览器缓存的旧文件能被检测出来。 */
+var BUILD_ID = '2026-10-29.3';
+
+var VER_PATH = '/luci-static/resources/singbox/core.ver.js';
+
+/*
+ * 取服务端真实的构建版本号。
+ * 用 cache:'no-store' 明确绕过 HTTP 缓存；如果浏览器不支持该选项，
+ * 退回到在 URL 上加时间戳强制绕过。
+ */
+function fetchServerBuildId() {
+	if (typeof fetch !== 'function')
+		return Promise.resolve(null);
+
+	var url = VER_PATH + '?t=' + Date.now();
+
+	return fetch(url, { cache: 'no-store', credentials: 'same-origin' })
+		.then(function(res) {
+			if (!res.ok)
+				return null;
+
+			return res.text();
+		}).then(function(txt) {
+			if (!txt)
+				return null;
+
+			var m = txt.match(/BUILD_ID\s*=\s*['"]([^'"]+)['"]/);
+
+			return m ? m[1] : null;
+		}).catch(function() {
+			return null;
+		});
+}
+
+/*
+ * 判断浏览器是否在用旧缓存。
+ * 返回 Promise，resolve 成 { stale: bool, server: string|null }
+ */
+function checkStaleBuild() {
+	return fetchServerBuildId().then(function(server) {
+		if (!server)
+			return { stale: false, server: null };
+
+		return { stale: (server !== BUILD_ID), server: server };
+	});
+}
+
 var B64CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 var B64MAP = null;
@@ -1761,5 +1830,9 @@ return baseclass.extend({
 	uciFindIpv6BlockRule: uciFindIpv6BlockRule,
 	uciIpv6BlockStatus: uciIpv6BlockStatus,
 	ipv6ProblemText: ipv6ProblemText,
-	isPrivateIp: isPrivateIp
+	isPrivateIp: isPrivateIp,
+	BUILD_ID: BUILD_ID,
+	VER_PATH: VER_PATH,
+	fetchServerBuildId: fetchServerBuildId,
+	checkStaleBuild: checkStaleBuild
 });

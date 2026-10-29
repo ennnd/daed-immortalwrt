@@ -355,6 +355,13 @@ ok('uciListHas 拒错值', core.uciListHas(fw['@zone[2]'].device, 'wan') === fal
 const zs = core.uciZoneStatus(fw);
 ok('uciZoneStatus 认出 input=REJECT', zs.ok === false && zs.problems.indexOf('input') >= 0, JSON.stringify(zs.problems));
 ok('uciZoneStatus 认出 forward=DROP', zs.problems.indexOf('forward') >= 0, JSON.stringify(zs.problems));
+/* ---------- 缓存自检（LuCI ?v= 不随内容变，热部署后浏览器仍用旧 JS） ---------- */
+ok('core 暴露 BUILD_ID', typeof core.BUILD_ID === 'string' && core.BUILD_ID.length > 0);
+ok('core 暴露 VER_PATH', typeof core.VER_PATH === 'string' && core.VER_PATH.indexOf('core.ver.js') > 0);
+ok('core 暴露 checkStaleBuild 函数', typeof core.checkStaleBuild === 'function');
+ok('core 暴露 fetchServerBuildId 函数', typeof core.fetchServerBuildId === 'function');
+ok('BUILD_ID 格式为日期+序号', /^\d{4}-\d{2}-\d{2}\.\d+$/.test(core.BUILD_ID), core.BUILD_ID);
+
 ok('uciZoneStatus 不再要求 wan->singbox 转发（该转发是多余的）',
 	zs.problems.indexOf('wan-forward') < 0, JSON.stringify(zs.problems));
 ok('uciZoneStatus 不误报 masq=0', zs.problems.indexOf('masq') < 0, JSON.stringify(zs.problems));
