@@ -3,6 +3,12 @@
 # 并允许 lan -> 该区转发。否则 sing-box 运行时，路由器自身有网，
 # 但 LAN 客户端（接在 br-lan 下的设备）全部上不了网。
 # 该脚本在首次刷机启动时执行一次。
+
+# 修可执行位：overlay 里的文件如果以 644 落到 /usr/bin，cron 会静默调用失败
+# （只写一条 cron.err），看门狗和 iface 热插拔脚本就此永久失效。
+chmod 755 /usr/bin/singbox-on /usr/bin/singbox-off /usr/bin/singbox-safestop \
+          /usr/bin/singbox-watchdog /etc/hotplug.d/iface/99-singbox 2>/dev/null || true
+
 z=""
 # 用 section 名定位，不能用数字下标：uci set firewall.2.input=... 会报
 # "uci: Invalid argument"（区已存在时取到 @zone[N]，不存在时 uci add 返回 cfgXXXX）。

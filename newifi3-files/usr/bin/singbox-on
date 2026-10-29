@@ -8,6 +8,12 @@ set -e
 
 CFG=/etc/sing-box/config.json
 
+# 自愈：脚本的可执行位在 Git 检出 / 打包 / scp 过程中很容易丢失，而且丢得很隐蔽 ——
+# cron 调用非可执行文件时只会往 syslog 写一条 cron.err，看门狗就此静默失效，
+# 热插拔脚本同理（iface 事件直接不触发）。每次启用时顺手补回。
+chmod 755 /usr/bin/singbox-on /usr/bin/singbox-off /usr/bin/singbox-safestop \
+          /usr/bin/singbox-watchdog /etc/hotplug.d/iface/99-singbox 2>/dev/null || true
+
 if grep -q '"YOUR_' "$CFG"; then
 	echo "ERROR: $CFG still contains YOUR_* placeholders" >&2
 	echo "Edit it first (vi or scp), then run this script again." >&2
