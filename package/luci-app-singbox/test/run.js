@@ -355,7 +355,8 @@ ok('uciListHas 拒错值', core.uciListHas(fw['@zone[2]'].device, 'wan') === fal
 const zs = core.uciZoneStatus(fw);
 ok('uciZoneStatus 认出 input=REJECT', zs.ok === false && zs.problems.indexOf('input') >= 0, JSON.stringify(zs.problems));
 ok('uciZoneStatus 认出 forward=DROP', zs.problems.indexOf('forward') >= 0, JSON.stringify(zs.problems));
-ok('uciZoneStatus 认出缺 wan->singbox 转发', zs.problems.indexOf('wan-forward') >= 0, JSON.stringify(zs.problems));
+ok('uciZoneStatus 不再要求 wan->singbox 转发（该转发是多余的）',
+	zs.problems.indexOf('wan-forward') < 0, JSON.stringify(zs.problems));
 ok('uciZoneStatus 不误报 masq=0', zs.problems.indexOf('masq') < 0, JSON.stringify(zs.problems));
 ok('fwProblemText 出中文说明', /ACCEPT/.test(core.fwProblemText(zs.problems)));
 

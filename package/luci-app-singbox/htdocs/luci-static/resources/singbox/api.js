@@ -501,17 +501,44 @@ api.finishFirewallZone = function(secs, z) {
 	if (!core.uciListHas((secs[z] || {})['device'], 'tun0'))
 		cmds.push([ 'add_list', 'firewall.' + z + '.device=tun0' ]);
 
+	/*
+	 * 删除旧版遗留的 wan->singbox 转发（幂等修复）。
+	 *
+	 * 刻意不建 wan->singbox：路由器自身发起的连接走 output 链
+	 * （output_singbox -> accept_to_singbox），不经过 forward 链，
+	 * 所以这条转发对"路由器自身走代理"没有任何作用（实测删掉后
+	 * 路由器自身与 LAN 客户端的代理都照常，出口 IP 仍是代理节点）。
+	 * 留着反而会放行"从 WAN 侧转发给 tun0"的流量，没有必要。
+	 *
+	 * 删除必须按索引数值降序：删掉一个后后面的索引会前移，
+	 * 顺序错了会漏删或删错段。
+	 */
+	var stale = [];
+
+	Object.keys(secs).forEach(function(sid) {
+		var s = secs[sid];
+
+		if (s.src === 'wan' && s.dest === 'singbox')
+			stale.push(sid);
+	});
+
+	stale.sort(function(a, b) {
+		var na = parseInt((a.match(/\[(\d+)\]/) || [ 0, 0 ])[1], 10);
+		var nb = parseInt((b.match(/\[(\d+)\]/) || [ 0, 0 ])[1], 10);
+
+		return nb - na;
+	}).forEach(function(sid) {
+		cmds.push([ '-q', 'delete', 'firewall.' + sid ]);
+	});
+
 	return self.uciSeq(cmds).then(function() {
 		return self.uci([ 'commit', 'firewall' ]);
 	}).then(function() {
-		/* 缺哪条转发就补哪条：lan->singbox 给 LAN 客户端，wan->singbox 给路由器自身 */
+		/* lan->singbox：给 LAN 客户端的流量进 TUN，缺了就补 */
 		var need = [];
 
 		if (!core.uciFindForwarding(secs, 'lan', 'singbox'))
 			need.push([ 'lan', 'singbox' ]);
-
-		if (!core.uciFindForwarding(secs, 'wan', 'singbox'))
-			need.push([ 'wan', 'singbox' ]);
 
 		function addNext(i) {
 			if (i >= need.length)

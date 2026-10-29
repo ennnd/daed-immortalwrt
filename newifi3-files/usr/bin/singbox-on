@@ -44,16 +44,19 @@ ensure_singbox_fw() {
     uci set firewall.$f.src='lan'
     uci set firewall.$f.dest='singbox'
   fi
-  # wan -> singbox：放行路由器自身经 TUN 出站的回程流量
-  f=""
-  for i in 0 1 2 3 4 5 6 7 8 9; do
-    if [ "$(uci -q get firewall.@forwarding[$i].src 2>/dev/null)" = "wan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest 2>/dev/null)" = "singbox" ]; then f=$i; break; fi
+  # ★ 刻意不建 wan -> singbox 转发，并主动删掉旧版留下的。
+  #   之前误加过一条，理由是"放行路由器自身经 TUN 出站的回程流量"——这是错的：
+  #   路由器自身发起的连接走的是 output 链（output_singbox -> accept_to_singbox），
+  #   根本不经过 forward 链。删掉它实测路由器自身与 LAN 客户端的代理都照常工作。
+  #   留着反而有安全含义：它会放行"从 WAN 侧进来、转发给 tun0"的流量，
+  #   等于把上游路由器那侧也接进代理隧道里，没有必要。
+  #   注意：这里必须用 section 名删除，不能用数字下标（uci delete firewall.@forwarding[2]
+  #   会因为索引漂移删错段）；且要倒序删，避免删掉一个后索引前移导致漏删。
+  for i in 9 8 7 6 5 4 3 2 1 0; do
+    if [ "$(uci -q get firewall.@forwarding[$i].src 2>/dev/null)" = "wan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest 2>/dev/null)" = "singbox" ]; then
+      uci -q delete firewall.@forwarding[$i] || true
+    fi
   done
-  if [ -z "$f" ]; then
-    f=$(uci add firewall forwarding)
-    uci set firewall.$f.src='wan'
-    uci set firewall.$f.dest='singbox'
-  fi
   uci commit firewall
   fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
 }

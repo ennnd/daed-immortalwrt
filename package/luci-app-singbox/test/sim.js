@@ -184,7 +184,7 @@ const uciData = {
 	},
 	/*
 	 * 防火墙布局刻意做成"修复前"的样子：singbox 区 input=REJECT / forward=DROP，
-	 * 且缺 wan->singbox 转发 —— 正是实机上让代理回程被拒、路由器自身出站报
+	 * 且缺 lan->singbox 转发 —— 正是实机上让代理回程被拒、路由器自身出站报
 	 * "Operation not permitted" 的那套配置。enable() 必须把它修好。
 	 */
 	firewall: {
@@ -192,7 +192,9 @@ const uciData = {
 		'@zone[1]': { '.type': 'zone', name: 'wan', network: 'wan' },
 		'@zone[2]': { '.type': 'zone', name: 'singbox', input: 'REJECT', output: 'ACCEPT', forward: 'DROP', masq: '0', device: 'tun0' },
 		'@forwarding[0]': { '.type': 'forwarding', src: 'lan', dest: 'wan' },
-		'@forwarding[1]': { '.type': 'forwarding', src: 'lan', dest: 'singbox' }
+		'@forwarding[1]': { '.type': 'forwarding', src: 'lan', dest: 'singbox' },
+		/* 旧版遗留的多余转发：enable() 应该把它删掉 */
+		'@forwarding[2]': { '.type': 'forwarding', src: 'wan', dest: 'singbox' }
 	}
 };
 
@@ -394,9 +396,25 @@ function load(name) {
 	check('enable 把 singbox 区 input 改成 ACCEPT', uciCall('set', 'firewall.@zone[2].input=ACCEPT'));
 	check('enable 把 singbox 区 forward 改成 ACCEPT', uciCall('set', 'firewall.@zone[2].forward=ACCEPT'));
 	check('enable 关闭 singbox 区 masquerade', uciCall('set', 'firewall.@zone[2].masq=0'));
-	check('enable 补上了缺失的 wan->singbox 转发',
-		enCalls.some(c => c[0] === 'exec' && (c[2] || '') === 'add' &&
-			(c[3] || '') === 'firewall' && (c[4] || '') === 'forwarding'));
+	/* 转发是先 uci add firewall forwarding 拿段名，再 uci set ...src=xxx/.dest=xxx */
+	const fwdSrc = (src) => enCalls.some(c => c[0] === 'exec' && /uci$/.test(c[1]) &&
+		(c[2] || '') === 'set' && String(c[3] || '').indexOf('.src=' + src) > 0 &&
+		String(c[3] || '').indexOf('firewall.') === 0);
+	const fwdDest = (dest) => enCalls.some(c => c[0] === 'exec' && /uci$/.test(c[1]) &&
+		(c[2] || '') === 'set' && String(c[3] || '').indexOf('.dest=' + dest) > 0 &&
+		String(c[3] || '').indexOf('firewall.') === 0);
+
+	/* fixture 里 lan->singbox 已存在，enable() 不应重复创建 */
+	check('enable 不重复创建已有的 lan->singbox 转发',
+		!enCalls.some(c => c[0] === 'exec' && /uci$/.test(c[1]) &&
+			(c[2] || '') === 'add' && (c[3] || '') === 'firewall' &&
+			(c[4] || '') === 'forwarding'));
+	check('enable 删掉旧版遗留的 wan->singbox 转发',
+		enCalls.some(c => c[0] === 'exec' && /uci$/.test(c[1]) &&
+			(c[2] || '') === '-q' && (c[3] || '') === 'delete' &&
+			String(c[4] || '').indexOf('firewall.@forwarding[2]') === 0));
+	check('enable 不创建多余的 wan->singbox 转发（路由器自身走 output 链，不需要）',
+		!fwdSrc('wan'));
 	check('enable 调用了 fw4 reload 让规则生效',
 		enCalls.some(c => c[0] === 'exec' && /fw4$/.test(c[1]) && (c[2] || '') === 'reload'));
 

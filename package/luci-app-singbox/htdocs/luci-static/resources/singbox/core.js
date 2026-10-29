@@ -1579,7 +1579,10 @@ function uciFindForwarding(sections, src, dest) {
  *   - input 必须 ACCEPT，否则 tun0 的回程包被 reject，路由器自身经代理出站
  *     直接报 "Operation not permitted"；
  *   - masq 必须关闭，否则对 tun0 做 SNAT，sing-box 收不到真实源地址、回包错乱；
- *   - lan->singbox 与 wan->singbox 两条转发都要有。
+ *   - lan->singbox 转发要有。
+ *
+ * 刻意不检查 wan->singbox：路由器自身经代理出站走的是 output 链，
+ * 不经过 forward 链，这条转发是多余的（而且会放行 WAN 侧流量进隧道）。
  */
 function uciZoneStatus(sections) {
 	var problems = [];
@@ -1596,7 +1599,6 @@ function uciZoneStatus(sections) {
 	if (String(s.masq) === '1') problems.push('masq');
 	if (!uciListHas(s.device, 'tun0')) problems.push('device');
 	if (!uciFindForwarding(sections, 'lan', 'singbox')) problems.push('lan-forward');
-	if (!uciFindForwarding(sections, 'wan', 'singbox')) problems.push('wan-forward');
 
 	return { ok: (problems.length === 0), zone: z, problems: problems };
 }
@@ -1655,8 +1657,7 @@ var FW_PROBLEM_TEXT = {
 	'forward': 'forward 不是 ACCEPT',
 	'masq': 'masq 未关闭（会对 tun0 做 SNAT）',
 	'device': '未把 tun0 加入该区',
-	'lan-forward': '缺少 lan→singbox 转发',
-	'wan-forward': '缺少 wan→singbox 转发'
+	'lan-forward': '缺少 lan→singbox 转发'
 };
 
 var IPV6_PROBLEM_TEXT = {
