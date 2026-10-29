@@ -11,9 +11,9 @@ if [ -z "$z" ]; then
   z=$(uci add firewall zone)
   uci set firewall.$z.name='singbox'
 fi
-uci set firewall.$z.input='REJECT'
+uci set firewall.$z.input='ACCEPT'
 uci set firewall.$z.output='ACCEPT'
-uci set firewall.$z.forward='DROP'
+uci set firewall.$z.forward='ACCEPT'
 uci set firewall.$z.masq='0'
 if ! uci -d '\n' get firewall.$z.device 2>/dev/null | grep -qx tun0; then
   uci add_list firewall.$z.device='tun0'
@@ -27,12 +27,23 @@ if [ -z "$f" ]; then
   uci set firewall.$f.src='lan'
   uci set firewall.$f.dest='singbox'
 fi
+# wan -> singbox：放行路由器自身经 TUN 出站的回程流量，否则路由器侧请求被 reject
+f=""
+for i in 0 1 2 3 4 5 6 7 8 9; do
+  if [ "$(uci -q get firewall.@forwarding[$i].src)" = "wan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
+done
+if [ -z "$f" ]; then
+  f=$(uci add firewall forwarding)
+  uci set firewall.$f.src='wan'
+  uci set firewall.$f.dest='singbox'
+fi
 uci commit firewall
 
 # 启用 cron，安装 sing-box watchdog（每 2 分钟检测国外站点，代理连不上国外但国内正常时自动停止 sing-box）
 if [ -x /etc/init.d/cron ]; then
   cat > /etc/crontabs/root <<'CRON'
-# sing-box watchdog: 每 2 分钟检测 baidu.com 可达性，不可达则自动停止 sing-box 并恢复直连
+# sing-box watchdog: 每 2 分钟检测国外站点可达性（google 为主、baidu 做对照），
+# 国外不可达但国内可达 -> 代理坏，自动停止 sing-box 并恢复直连
 */2 * * * * /usr/bin/singbox-watchdog
 CRON
   /etc/init.d/cron enable 2>/dev/null

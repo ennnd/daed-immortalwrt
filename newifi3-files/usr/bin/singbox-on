@@ -1,8 +1,9 @@
 #!/bin/sh
 # 在路由器上填好 /etc/sing-box/config.json 后执行本脚本：
 #   - 校验配置
-#   - 启动 sing-box（失败则不改 dnsmasq，避免断网）
-#   - 成功后把 dnsmasq 改为只做 DHCP，LAN DNS 指向 223.5.5.5（由 TUN 接管）
+#   - 先配置并 reload 防火墙（singbox 区 + 转发规则），保证 TUN 流量放行
+#   - 再启动 sing-box（顺序很重要：防火墙必须早于 sing-box，否则 TUN 规则被 fw4 冲洗掉）
+#   - 不接管 DNS：本机 dnsmasq 保持监听 :53，避免“接管后无人监听 :53”导致整网解析瘫痪
 set -e
 
 CFG=/etc/sing-box/config.json
@@ -12,6 +13,49 @@ if grep -q '"YOUR_' "$CFG"; then
 	echo "Edit it first (vi or scp), then run this script again." >&2
 	exit 1
 fi
+
+# 先配置防火墙（独立 singbox 区，放行 input/output/forward，不 masquerade），并 reload
+# 否则 sing-box 运行时，路由器自身 / LAN 客户端的流量可能被拒绝或丢弃。
+ensure_singbox_fw() {
+  local z="" i f=""
+  for i in 0 1 2 3 4 5 6 7 8 9; do
+    [ "$(uci -q get firewall.@zone[$i].name)" = "singbox" ] && { z=$i; break; }
+  done
+  if [ -z "$z" ]; then
+    z=$(uci add firewall zone)
+    uci set firewall.$z.name='singbox'
+  fi
+  uci set firewall.$z.input='ACCEPT'
+  uci set firewall.$z.output='ACCEPT'
+  uci set firewall.$z.forward='ACCEPT'
+  uci set firewall.$z.masq='0'
+  if ! uci -d '\n' get firewall.$z.device 2>/dev/null | grep -qx tun0; then
+    uci add_list firewall.$z.device='tun0'
+  fi
+  # lan -> singbox
+  f=""
+  for i in 0 1 2 3 4 5 6 7 8 9; do
+    if [ "$(uci -q get firewall.@forwarding[$i].src)" = "lan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
+  done
+  if [ -z "$f" ]; then
+    f=$(uci add firewall forwarding)
+    uci set firewall.$f.src='lan'
+    uci set firewall.$f.dest='singbox'
+  fi
+  # wan -> singbox：放行路由器自身经 TUN 出站的回程流量
+  f=""
+  for i in 0 1 2 3 4 5 6 7 8 9; do
+    if [ "$(uci -q get firewall.@forwarding[$i].src)" = "wan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
+  done
+  if [ -z "$f" ]; then
+    f=$(uci add firewall forwarding)
+    uci set firewall.$f.src='wan'
+    uci set firewall.$f.dest='singbox'
+  fi
+  uci commit firewall
+  fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
+}
+ensure_singbox_fw
 
 sing-box check -c "$CFG"
 
@@ -29,51 +73,13 @@ while [ "$i" -lt 10 ]; do
 done
 
 if ! pidof sing-box >/dev/null 2>&1; then
-	echo "ERROR: sing-box failed to start; dnsmasq left unchanged" >&2
+	echo "ERROR: sing-box failed to start" >&2
 	logread -e sing-box | tail -n 30 >&2
 	exit 1
 fi
-
-uci set dhcp.@dnsmasq[0].port='0'
-uci -q delete dhcp.lan.dhcp_option
-uci add_list dhcp.lan.dhcp_option='6,223.5.5.5'
-uci commit dhcp
-/etc/init.d/dnsmasq restart
-
-# 确保 TUN 设备被放进独立防火墙区（不 masquerade），允许 LAN->TUN 转发。
-# 否则 sing-box 运行时，路由器自身有网但 LAN 客户端全部上不了网。
-ensure_singbox_fw() {
-  local z="" i
-  for i in 0 1 2 3 4 5 6 7 8 9; do
-    [ "$(uci -q get firewall.@zone[$i].name)" = "singbox" ] && { z=$i; break; }
-  done
-  if [ -z "$z" ]; then
-    z=$(uci add firewall zone)
-    uci set firewall.$z.name='singbox'
-  fi
-  uci set firewall.$z.input='REJECT'
-  uci set firewall.$z.output='ACCEPT'
-  uci set firewall.$z.forward='DROP'
-  uci set firewall.$z.masq='0'
-  if ! uci -d '\n' get firewall.$z.device 2>/dev/null | grep -qx tun0; then
-    uci add_list firewall.$z.device='tun0'
-  fi
-  local f=""
-  for i in 0 1 2 3 4 5 6 7 8 9; do
-    if [ "$(uci -q get firewall.@forwarding[$i].src)" = "lan" ] && [ "$(uci -q get firewall.@forwarding[$i].dest)" = "singbox" ]; then f=$i; break; fi
-  done
-  if [ -z "$f" ]; then
-    f=$(uci add firewall forwarding)
-    uci set firewall.$f.src='lan'
-    uci set firewall.$f.dest='singbox'
-  fi
-  uci commit firewall
-  fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
-}
-ensure_singbox_fw
 
 echo "--- sing-box status ---"
 /etc/init.d/sing-box status || true
 echo "--- last log ---"
 logread -e sing-box | tail -n 20
-echo "OK: sing-box is running; dnsmasq DNS disabled, LAN DNS -> 223.5.5.5"
+echo "OK: sing-box running; dnsmasq left on :53 (no DNS takeover), singbox fw zone ACCEPT"
