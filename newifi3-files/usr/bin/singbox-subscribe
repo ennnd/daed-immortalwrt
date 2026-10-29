@@ -381,6 +381,9 @@ if [ "$DRY" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------- 生成 outbounds
+# 注意 reuse_addr：direct 出站必须带这个字段，否则 sing-box 启动时会把
+# DNS 的 "detour": "direct" 判成「detour to an empty direct outbound」直接 FATAL。
+# 这个错误 sing-box check 查不出来，只有真正启动才暴露 —— 所以下面还要做健康检查。
 jq '
 	(map(.tag)) as $tags
 	| [ { type: "selector", tag: "proxy",
@@ -389,7 +392,7 @@ jq '
 	      outbounds: $tags,
 	      url: "https://cp.cloudflare.com/generate_204",
 	      interval: "3m", tolerance: 50 },
-	    { type: "direct", tag: "direct" } ] + .
+	    { type: "direct", tag: "direct", reuse_addr: true } ] + .
 ' "$WORK/nodes.json" > "$WORK/outbounds.json" || die "生成 outbounds 失败"
 
 # 去掉最外层 [ ]，其余缩进正好落进 config 的 outbounds 数组（补 2 空格对齐）
@@ -403,10 +406,14 @@ sed -n '1,/>>> NODES BEGIN/p' "$CONF" > "$WORK/config.new"
 cat "$WORK/ob.txt" >> "$WORK/config.new"
 sed -n '/<<< NODES END/,$p' "$CONF" >> "$WORK/config.new"
 
-# 节点完全没变就不重启，避免每 6 小时把连接打断一次
+# 节点完全没变就不重启，避免每 6 小时把连接打断一次。
+# 判据是“配置里现有那段”和“新生成那段”的哈希，不依赖外部状态文件 ——
+# 用独立状态文件出过问题：中途用测试配置跑过一次，状态被写成新哈希，
+# 而线上配置其实没变，于是真正更新时被误判成“无变化”直接跳过。
 new_md5=$(md5sum < "$WORK/ob.txt" | cut -d' ' -f1)
-old_md5=$(cat /etc/sing-box/.nodes.md5 2>/dev/null)
-if [ -n "$old_md5" ] && [ "$new_md5" = "$old_md5" ]; then
+cur_md5=$(sed -n '/>>> NODES BEGIN/,/<<< NODES END/p' "$CONF" \
+	| grep -v 'NODES BEGIN\|NODES END' | md5sum | cut -d' ' -f1)
+if [ "$new_md5" = "$cur_md5" ]; then
 	log "节点无变化（$total 个），跳过重启"
 	exit 0
 fi
@@ -416,27 +423,51 @@ sing-box check -c "$WORK/config.new" >/dev/null 2>&1 \
 
 cp "$CONF" "$CONF.bak.subscribe"
 cp "$WORK/config.new" "$CONF"
-printf '%s\n' "$new_md5" > /etc/sing-box/.nodes.md5
 
 log "已更新 $total 个节点（解析 $parsed，跳过 $skipped，筛掉 $n_drop）"
 
 # ---------------------------------------------------------------- 生效
+# 回滚：配置语法对、进程也能起来，不代表能用 —— 参数写错（比如漏了 reuse_addr）
+# 会表现为启动即 FATAL 崩溃循环，或起来了但一个节点都连不上。所以必须实测。
+
+rollback() {
+	cp "$CONF.bak.subscribe" "$CONF"
+	/etc/init.d/sing-box restart >/dev/null 2>&1
+	rm -f /tmp/.sb_wd_seen
+	die "$1（已回滚到上一版配置）"
+}
+
+health_ok() {
+	i=0
+	while [ "$i" -lt 5 ]; do
+		out=$(wget -O /dev/null -T 8 https://cp.cloudflare.com/generate_204 2>&1)
+		case "$out" in
+			*"0 bytes"*) return 0 ;;
+		esac
+		sleep 4
+		i=$((i + 1))
+	done
+	return 1
+}
+
 if pidof sing-box >/dev/null 2>&1; then
 	rm -f /tmp/.sb_wd_seen            # 重启后给看门狗重新计时，避免刚起来就被判死
 	/etc/init.d/sing-box restart >/dev/null 2>&1
 	sleep 4
-	i=0
-	while [ "$i" -lt 10 ]; do
-		pidof sing-box >/dev/null 2>&1 && break
-		sleep 1; i=$((i + 1))
-	done
 
-	if ! pidof sing-box >/dev/null 2>&1; then
-		cp "$CONF.bak.subscribe" "$CONF"
-		/etc/init.d/sing-box restart >/dev/null 2>&1
-		die "重启后 sing-box 未起来，已回滚到上一版配置"
-	fi
-	log "sing-box 已重启（pid $(pidof sing-box)）"
+	# 崩溃循环时 pid 会一闪而过，光看 pidof 会误判，这里连续观察 6 秒
+	stable=1
+	i=0
+	while [ "$i" -lt 6 ]; do
+		pidof sing-box >/dev/null 2>&1 || { stable=0; break; }
+		sleep 1
+		i=$((i + 1))
+	done
+	[ "$stable" = "1" ] || rollback "sing-box 启动后不稳定（崩溃循环）"
+
+	health_ok || rollback "新节点实测不通（204 探测连续失败）"
+
+	log "sing-box 已重启并通过连通性检查（pid $(pidof sing-box)）"
 else
 	log "sing-box 当前未运行，配置已更新，下次启用时生效"
 fi
