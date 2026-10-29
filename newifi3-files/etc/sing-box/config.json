@@ -22,10 +22,14 @@
     // 必须用 type + server。
     "servers": [
       {
-        // 国内：UDP 直连，延迟最低
+        // 国内：DoT(853) 加密直连，不要用明文 UDP。
+        // 明文 UDP 的应答在链路上会被运营商注入/劫持：实测 www.gstatic.com 这类
+        // 域名会拿回 114.250.x（联通）的假地址；换成 DoT 后这条注入路径被 TLS 挡掉。
         "tag": "dns_cn",
-        "type": "udp",
+        "type": "tls",
         "server": "223.5.5.5",
+        "server_port": 853,
+        "tls": { "server_name": "dns.alidns.com" },
         "detour": "direct"
       },
       {
@@ -37,6 +41,26 @@
       }
     ],
     "rules": [
+      // ★ 必须在 geosite-cn 之前：geosite-cn 里混进了 www.gstatic.com /
+      //   ssl.gstatic.com / connectivitycheck.gstatic.com 这些 Google 域名
+      //   （早期给国内 Android 连通性检查用的）。如果让它们走 dns_cn，
+      //   阿里会返回无效地址（114.250.x 联通段），urltest 探测随之全灭。
+      {
+        "domain_suffix": [
+          "gstatic.com",
+          "google.com",
+          "googleapis.com",
+          "googleusercontent.com",
+          "ggpht.com",
+          "googlevideo.com",
+          "gvt1.com",
+          "gvt2.com",
+          "youtube.com",
+          "ytimg.com"
+        ],
+        "action": "route",
+        "server": "dns_proxy"
+      },
       {
         "rule_set": "geosite-cn",
         "action": "route",
@@ -101,8 +125,10 @@
         "node2",
         "node3"
       ],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "10m",
+      // 探测目标不要用 www.gstatic.com：它被 geosite-cn 收录，容易跟着走国内 DNS
+      // 解析到无效地址，导致所有节点被误判为不可用。
+      "url": "https://cp.cloudflare.com/generate_204",
+      "interval": "3m",
       "tolerance": 50
     },
     {
@@ -193,6 +219,23 @@
       {
         "ip_is_private": true,
         "outbound": "direct"
+      },
+      // 与 dns.rules 同理：这些域名虽然被 geosite-cn 收录，但直连必然失败，
+      // 必须显式送到代理，且要排在 geosite-cn → direct 之前。
+      {
+        "domain_suffix": [
+          "gstatic.com",
+          "google.com",
+          "googleapis.com",
+          "googleusercontent.com",
+          "ggpht.com",
+          "googlevideo.com",
+          "gvt1.com",
+          "gvt2.com",
+          "youtube.com",
+          "ytimg.com"
+        ],
+        "outbound": "proxy"
       },
       {
         "rule_set": "geosite-cn",

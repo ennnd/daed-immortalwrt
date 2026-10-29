@@ -1,0 +1,54 @@
+#!/bin/sh
+# pre-commit：拦截“把订阅/节点凭据提交进仓库”这类事故。
+#
+# 为什么要这道闸：订阅链接本身就是账号（拿到链接就能拉全部节点），
+# UUID 也是凭据；这类东西一旦进了公开仓库，删 commit 也来不及 —— 副本、
+# fork、GitHub 的缓存都可能已经抓走。所以在提交时挡住最省事。
+#
+# 启用：git config core.hooksPath .githooks
+set -u
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+for f in $staged; do
+	# 1) 按路径拦截：这些文件属于“设备本地状态”，不该入库
+	case "$f" in
+		*/subscription.url|*/subscription.filter|*/nodes.json)
+			echo "pre-commit: 拒绝提交 $f（订阅凭证只放设备上，不入库）" >&2
+			fail=1
+			continue
+			;;
+		*.bak|*.bak.*|*/rule-set/*.srs)
+			echo "pre-commit: 拒绝提交 $f（备份/规则集不入库）" >&2
+			fail=1
+			continue
+			;;
+	esac
+
+	# 2) 按内容拦截：抓真实 UUID（8-4-4-4-12 十六进制）与已知私有标识
+	#    本钩子自身和 .gitignore 里就有这些关键字/正则，必须跳过，否则自我误报
+	case "$f" in
+		.githooks/*|.gitignore)
+			continue
+			;;
+	esac
+
+	#    二进制文件跳过，避免 grep 报 binary file matches
+	if git show :"$f" 2>/dev/null | grep -qE '"uuid"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'; then
+		echo "pre-commit: $f 里出现真实 UUID，请改回 YOUR_UUID 占位符" >&2
+		fail=1
+	fi
+	if git show :"$f" 2>/dev/null | grep -qiE 'portablesubmarines|token=[A-Za-z0-9]{16,}'; then
+		echo "pre-commit: $f 里出现疑似订阅链接/令牌" >&2
+		fail=1
+	fi
+done
+
+[ "$fail" = "0" ] || {
+	echo "" >&2
+	echo "已阻止提交。确认是误报时可用 git commit --no-verify 跳过（不推荐）。" >&2
+	exit 1
+}
+
+exit 0

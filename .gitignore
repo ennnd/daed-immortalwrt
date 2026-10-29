@@ -1,0 +1,14 @@
+# 订阅 / 节点凭据：只在设备上存在，绝不入库
+newifi3-files/etc/sing-box/subscription.url
+newifi3-files/etc/sing-box/subscription.filter
+newifi3-files/etc/sing-box/nodes.json
+newifi3-files/etc/sing-box/*.bak
+newifi3-files/etc/sing-box/*.bak.*
+
+# 运行时下载的规则集（体积大且来自上游，走面板/脚本更新即可）
+newifi3-files/etc/sing-box/rule-set/
+
+# 备份与临时产物
+*.bak
+*.tmp
+*.old
