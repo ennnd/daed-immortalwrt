@@ -32,7 +32,7 @@
 
 /* 本包的构建版本号。任何改动本包前端文件后都应递增，
    这样浏览器缓存的旧文件能被检测出来。 */
-var BUILD_ID = '2026-10-29.4';
+var BUILD_ID = '2026-10-30.1';
 
 var VER_PATH = '/luci-static/resources/singbox/core.ver.js';
 

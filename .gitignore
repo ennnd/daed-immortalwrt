@@ -13,3 +13,5 @@ newifi3-files/etc/sing-box/rule-set/
 *.tmp
 *.old
 newifi3-files/etc/sing-box/dead-nodes
+newifi3-files/etc/sing-box/nodes.pool.json
+newifi3-files/etc/sing-box/nodes.selected.json

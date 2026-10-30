@@ -1,0 +1,358 @@
+#!/bin/sh
+# singbox-nodes —— 节点池 / 选择状态 / 配置生成 的唯一实现
+#
+# 为什么要有它：以前订阅脚本和 LuCI 面板各自维护“要哪些节点”，又都整份回写
+# config.json，于是互相覆盖（面板里删掉的节点，6 小时后订阅又装回来；订阅刚写的
+# 节点，面板保存一次就没了）。现在把三件事拆开，各归各的文件：
+#
+#   /etc/sing-box/nodes.pool.json      订阅全量节点，只由拉取动作写入，不做取舍
+#   /etc/sing-box/nodes.selected.json  选择状态 {enabled, denied, manual}
+#   /etc/sing-box/config.json          outbounds 段是生成物，只能由本脚本改
+#
+# 用法：
+#   singbox-nodes apply            按当前选择重建 outbounds → check → 生效
+#   singbox-nodes list             列出池中节点及其状态（启用/停用/未决定）
+#   singbox-nodes on  TAG...       启用指定节点
+#   singbox-nodes off TAG...       停用指定节点（写入 denied，自动选择不会再加回来）
+#   singbox-nodes auto             按 subscription.filter 给“未决定”的新节点定默认值
+#   singbox-nodes -n apply         只打印将启用的节点，不写配置
+#
+# 环境变量（测试用）：SINGBOX_POOL / SINGBOX_SEL / SINGBOX_SUB_CONF / SINGBOX_SUB_FILTER
+
+set -u
+
+POOL=${SINGBOX_POOL:-/etc/sing-box/nodes.pool.json}
+SEL=${SINGBOX_SEL:-/etc/sing-box/nodes.selected.json}
+CONF=${SINGBOX_SUB_CONF:-/etc/sing-box/config.json}
+FILTF=${SINGBOX_SUB_FILTER:-/etc/sing-box/subscription.filter}
+DEADF=/etc/sing-box/dead-nodes
+WORK=/tmp/sb-nodes
+TAG=singbox-nodes
+SEL_NEW=0
+
+log() { logger -t "$TAG" "$*" 2>/dev/null; echo "$*"; }
+die() { logger -t "$TAG" "ERROR: $*" 2>/dev/null; echo "ERROR: $*" >&2; exit 1; }
+
+mkdir -p "$WORK" || die "无法创建临时目录 $WORK"
+
+DRY=0
+CMD=""
+REST=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-n|--dry-run) DRY=1 ;;
+		-h|--help)    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-*)           die "未知参数: $1" ;;
+		*)            if [ -z "$CMD" ]; then CMD="$1"; else REST="$REST $1"; fi ;;
+	esac
+	shift
+done
+
+# ---------------------------------------------------------------- 基础
+
+sel_init() {
+	if [ -f "$SEL" ]; then
+		jq -e 'type=="object"' "$SEL" >/dev/null 2>&1 || die "选择状态文件损坏: $SEL"
+		jq '.enabled //= [] | .denied //= [] | .manual //= []' "$SEL" > "$SEL.tmp" \
+			&& mv "$SEL.tmp" "$SEL" || die "规范化选择状态失败"
+	else
+		printf '%s\n' '{"enabled":[],"denied":[],"manual":[]}' > "$SEL" || die "无法写入 $SEL"
+		chmod 600 "$SEL" 2>/dev/null
+		SEL_NEW=1
+	fi
+}
+
+# 首次启用新结构时的迁移：config.json 里已经有、但不属于订阅池的节点，
+# 收进 manual。否则第一次 apply 会按“池子+manual”重建，把它们直接抹掉。
+seed_manual_from_config() {
+	[ -f "$CONF" ] || return 0
+	[ -f "$POOL" ] || return 0
+
+	sed '/^[[:space:]]*\/\//d' "$CONF" > "$WORK/conf.seed.json" 2>/dev/null || return 0
+
+	jq --slurpfile pool "$POOL" '
+		[ .outbounds[]?
+		  | select((.type | ascii_downcase) as $ty
+		           | [ "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic" ] | index($ty))
+		  | . as $n
+		  | select((($pool[0].nodes // []) | map(.tag) | index($n.tag)) == null)
+		  | $n ]
+		| map(select((tostring | test("YOUR_")) | not))
+	' "$WORK/conf.seed.json" > "$WORK/seed.json" 2>/dev/null || return 0
+
+	[ -s "$WORK/seed.json" ] || return 0
+	n=$(jq 'length' "$WORK/seed.json" 2>/dev/null || echo 0)
+	[ "$n" -gt 0 ] || return 0
+
+	jq --slurpfile seed "$WORK/seed.json" '
+		.manual = ((.manual // []) + $seed[0] | reduce .[] as $x ([]; if any(.[]; .tag == $x.tag) then . else . + [ $x ] end))
+	' "$SEL" > "$SEL.tmp" && mv "$SEL.tmp" "$SEL" || return 0
+
+	log "迁移：把 $n 个原有手工节点收进选择状态，避免被本次重建抹掉"
+}
+
+# dead 名单（nodecheck 判定为坏的节点，TTL 6 小时内不再启用）
+dead_list() {
+	: > "$WORK/dead.txt"
+	if [ -s "$DEADF" ]; then
+		now=$(date +%s)
+		awk -F'\t' -v ttl=21600 -v now="$now" \
+			'NF==2 && (now - $2) < ttl { print $1 }' "$DEADF" > "$WORK/dead.txt"
+	fi
+}
+
+# 产出“应启用的节点”ndjson：池中已启用 + 手工节点，按池顺序
+effective_nodes() {
+	jq -c --slurpfile sel "$SEL" '
+		($sel[0].enabled // []) as $en
+		| [ (.nodes // [])[] | select(.tag as $t | $en | index($t)) ]
+		  + ($sel[0].manual // [])
+		| .[]
+	' "$POOL"
+}
+
+# ---------------------------------------------------------------- list
+
+cmd_list() {
+	[ -f "$POOL" ] || die "节点池不存在（先跑一次 singbox-subscribe）"
+	sel_init
+	jq -r --slurpfile sel "$SEL" '
+		($sel[0].enabled // []) as $en
+		| ($sel[0].denied // []) as $dn
+		| (.nodes // [])[]
+		| .tag as $t
+		| (if ($en | index($t)) then "启用" elif ($dn | index($t)) then "停用" else "未决定" end)
+		  + "\t" + $t
+	' "$POOL"
+	man=$(jq '.manual | length' "$SEL" 2>/dev/null || echo 0)
+	[ "$man" -gt 0 ] && echo "（另有 $man 个手工节点）"
+	return 0
+}
+
+# ---------------------------------------------------------------- on / off
+
+cmd_toggle() {
+	_want=$1
+	[ -f "$POOL" ] || die "节点池不存在（先跑一次 singbox-subscribe）"
+	[ -n "$REST" ] || die "用法: singbox-nodes $CMD TAG..."
+	sel_init
+	for t in $REST; do
+		if [ "$_want" = "on" ]; then
+			jq --arg t "$t" '.enabled = ((.enabled // []) + [$t] | unique) | .denied = ((.denied // []) - [$t])' \
+				"$SEL" > "$SEL.tmp" || die "更新选择状态失败"
+		else
+			jq --arg t "$t" '.denied = ((.denied // []) + [$t] | unique) | .enabled = ((.enabled // []) - [$t])' \
+				"$SEL" > "$SEL.tmp" || die "更新选择状态失败"
+		fi
+		mv "$SEL.tmp" "$SEL"
+		echo "$_want: $t"
+	done
+}
+
+# ---------------------------------------------------------------- auto
+
+# 给“既不在 enabled 也不在 denied”的节点按筛选规则定默认值。
+# 关键点：已经被你明确选择过（启用或停用）的节点，永远不覆盖。
+cmd_auto() {
+	[ -f "$POOL" ] || die "节点池不存在"
+	sel_init
+	[ "${SEL_NEW:-0}" = "1" ] && seed_manual_from_config
+
+	keep_re=""
+	excl_re=""
+	min_pool=2
+
+	if [ -s "$FILTF" ]; then
+		while IFS= read -r kw; do
+			kw=$(printf '%s' "$kw" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+			[ -n "$kw" ] || continue
+			case "$kw" in
+				'#@min '*)
+					v=$(printf '%s' "${kw#\#@min }" | tr -d ' ')
+					case "$v" in ''|*[!0-9]*) ;; *) min_pool="$v" ;; esac
+					continue ;;
+			esac
+			case "$kw" in \#*) continue ;; esac
+			case "$kw" in
+				!*) excl_re="${excl_re}|$(printf '%s' "${kw#!}" | tr 'A-Z' 'a-z')" ;;
+				*)  keep_re="${keep_re}|$(printf '%s' "$kw" | tr 'A-Z' 'a-z')" ;;
+			esac
+		done < "$FILTF"
+	fi
+	keep_re=${keep_re#|}
+	excl_re=${excl_re#|}
+
+	jq -r '.nodes[].tag' "$POOL" > "$WORK/tags.txt"
+	add_en=""
+	add_dn=""
+
+	while IFS= read -r t; do
+		[ -n "$t" ] || continue
+		[ "$(jq -r --arg t "$t" '(.enabled // []) | index($t) != null' "$SEL")" = "true" ] && continue
+		[ "$(jq -r --arg t "$t" '(.denied  // []) | index($t) != null' "$SEL")" = "true" ] && continue
+
+		name=$(printf '%s' "$t" | tr 'A-Z' 'a-z')
+		drop=0
+		if [ -n "$excl_re" ] && printf '%s' "$name" | grep -qE "$excl_re"; then drop=1; fi
+		if [ "$drop" = "0" ] && [ -n "$keep_re" ] && ! printf '%s' "$name" | grep -qE "$keep_re"; then drop=1; fi
+
+		if [ "$drop" = "1" ]; then add_dn="$add_dn$t
+"; else add_en="$add_en$t
+"; fi
+	done < "$WORK/tags.txt"
+
+	if [ "$DRY" = "1" ]; then
+		echo "--- 将自动启用 ---"
+		printf '%s' "$add_en"
+		echo "--- 将自动停用 ---"
+		printf '%s' "$add_dn"
+		return 0
+	fi
+
+	jq --arg en "$add_en" --arg dn "$add_dn" '
+		.enabled = ((.enabled // []) + ($en | split("\n") | map(select(length > 0))) | unique)
+		| .denied = ((.denied // []) + ($dn | split("\n") | map(select(length > 0))) | unique)
+	' "$SEL" > "$SEL.tmp" && mv "$SEL.tmp" "$SEL" || die "写入自动选择结果失败"
+
+	# 兜底补位：启用的节点少于 min_pool 个时，从“未停用”的节点里按池顺序补足。
+	# 否则池里全挂时订阅再怎么刷新也只会启用同一批，等于没有备用。
+	jq --slurpfile pool "$POOL" --argjson min "$min_pool" '
+		($pool[0].nodes // []) as $nodes
+		| ($nodes | map(.tag)) as $all
+		| (.enabled // []) as $en
+		| (.denied  // []) as $dn
+		| [ $all[] | select(. as $t | $en | index($t)) ] as $cur
+		| if ($min > 0 and ($cur | length) < $min) then
+			([ $all[] | select(. as $t | (($en | index($t)) == null) and (($dn | index($t)) == null)) ]
+				[0:($min - ($cur | length))]) as $add
+			| .enabled = ($en + $add)
+		  else . end
+	' "$SEL" > "$SEL.tmp" && mv "$SEL.tmp" "$SEL" || die "补位失败"
+
+	log "自动选择完成：新增启用 $(printf '%s' "$add_en" | grep -c . )，新增停用 $(printf '%s' "$add_dn" | grep -c .)"
+}
+
+# ---------------------------------------------------------------- apply
+
+cmd_apply() {
+	[ -f "$POOL" ] || die "节点池不存在（先跑一次 singbox-subscribe）"
+	[ -f "$CONF" ] || die "配置文件不存在: $CONF"
+	sel_init
+	[ "${SEL_NEW:-0}" = "1" ] && seed_manual_from_config
+	dead_list
+
+	effective_nodes > "$WORK/eff.ndjson" || die "读取节点池失败"
+	: > "$WORK/keep.ndjson"
+	n_dead=0
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		t=$(printf '%s' "$line" | jq -r '.tag // ""' 2>/dev/null)
+		if [ -s "$WORK/dead.txt" ] && grep -qxF "$t" "$WORK/dead.txt"; then
+			n_dead=$((n_dead + 1)); continue
+		fi
+		printf '%s\n' "$line" >> "$WORK/keep.ndjson"
+	done < "$WORK/eff.ndjson"
+
+	total=$(wc -l < "$WORK/keep.ndjson" | tr -d ' ')
+	n_sel=$(jq '.enabled | length' "$SEL")
+	[ "$total" -gt 0 ] || die "启用后没有可用节点（已启用 $n_sel 个，其中 $n_dead 个在 dead 名单里；用 singbox-nodes list 查看）"
+
+	jq -s '.' "$WORK/keep.ndjson" > "$WORK/nodes.json" || die "合并节点失败"
+
+	if [ "$DRY" = "1" ]; then
+		echo "将启用 $total 个节点（已选 $n_sel，dead 跳过 $n_dead）"
+		jq -r '.[].tag' "$WORK/nodes.json"
+		return 0
+	fi
+
+	# reuse_addr 不能少：direct 出站为空时 sing-box 启动会 FATAL
+	# 「detour to an empty direct outbound makes no sense」，而 check 查不出来。
+	jq '
+		(map(.tag)) as $tags
+		| [ { type: "selector", tag: "proxy",
+		      outbounds: (["auto"] + $tags), default: "auto" },
+		    { type: "urltest", tag: "auto",
+		      outbounds: $tags,
+		      url: "https://cp.cloudflare.com/generate_204",
+		      interval: "3m", tolerance: 50 },
+		    { type: "direct", tag: "direct", reuse_addr: true } ] + .
+	' "$WORK/nodes.json" > "$WORK/outbounds.json" || die "生成 outbounds 失败"
+
+	jq . < "$WORK/outbounds.json" | sed '1d;$d' | sed 's/^/  /' > "$WORK/ob.txt"
+
+	# 标记可能不存在 —— 面板保存配置会重新序列化 JSON，注释（含标记）会丢。
+	if grep -q '>>> NODES BEGIN' "$CONF" && grep -q '<<< NODES END' "$CONF"; then
+		sed -n '1,/>>> NODES BEGIN/p' "$CONF" > "$WORK/config.new"
+		cat "$WORK/ob.txt" >> "$WORK/config.new"
+		sed -n '/<<< NODES END/,$p' "$CONF" >> "$WORK/config.new"
+	else
+		sed '/^[[:space:]]*\/\//d' "$CONF" > "$WORK/conf.json" || die "读取配置失败"
+		jq --slurpfile ob "$WORK/outbounds.json" '.outbounds = $ob[0]' "$WORK/conf.json" > "$WORK/config.new" \
+			|| die "重写配置失败"
+	fi
+
+	new_md5=$(jq -c . "$WORK/outbounds.json" | md5sum | cut -d' ' -f1)
+	cur_md5=$(sed '/^[[:space:]]*\/\//d' "$CONF" | jq -c '.outbounds' 2>/dev/null | md5sum | cut -d' ' -f1)
+
+	if [ "$new_md5" = "$cur_md5" ]; then
+		log "节点无变化（$total 个），跳过重启"
+		return 0
+	fi
+
+	sing-box check -c "$WORK/config.new" >/dev/null 2>&1 \
+		|| { sing-box check -c "$WORK/config.new" 2>&1 | tail -5; die "新配置校验失败，已放弃（原配置未改动）"; }
+
+	cp "$CONF" "$CONF.bak.nodes"
+	cp "$WORK/config.new" "$CONF"
+
+	log "已启用 $total 个节点（dead 跳过 $n_dead）"
+
+	# 进程起来 ≠ 能用：参数错会崩溃循环，节点全坏会起来但一个都连不上
+	rollback() {
+		cp "$CONF.bak.nodes" "$CONF"
+		/etc/init.d/sing-box restart >/dev/null 2>&1
+		rm -f /tmp/.sb_wd_seen
+		die "$1（已回滚到上一版配置）"
+	}
+
+	health_ok() {
+		i=0
+		while [ "$i" -lt 5 ]; do
+			out=$(wget -O /dev/null -T 8 https://cp.cloudflare.com/generate_204 2>&1)
+			case "$out" in *"0 bytes"*) return 0 ;; esac
+			sleep 4
+			i=$((i + 1))
+		done
+		return 1
+	}
+
+	if pidof sing-box >/dev/null 2>&1; then
+		rm -f /tmp/.sb_wd_seen
+		/etc/init.d/sing-box restart >/dev/null 2>&1
+		sleep 4
+		stable=1
+		i=0
+		while [ "$i" -lt 6 ]; do
+			pidof sing-box >/dev/null 2>&1 || { stable=0; break; }
+			sleep 1
+			i=$((i + 1))
+		done
+		[ "$stable" = "1" ] || rollback "sing-box 启动后不稳定（崩溃循环）"
+		health_ok || rollback "节点实测不通（204 探测连续失败）"
+		log "sing-box 已重启并通过连通性检查（pid $(pidof sing-box)）"
+	else
+		log "sing-box 当前未运行，配置已更新，下次启用时生效"
+	fi
+}
+
+case "$CMD" in
+	apply) cmd_apply ;;
+	list)  cmd_list ;;
+	type*|'') sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
+	on)    cmd_toggle on ;;
+	off)   cmd_toggle off ;;
+	auto)  cmd_auto ;;
+	*)     die "未知命令: $CMD（可用: apply / list / on / off / auto）" ;;
+esac
+
+exit 0

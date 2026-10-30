@@ -144,6 +144,126 @@ const fakeFs = {
 			return Promise.resolve({ code: 0, stdout: hit ? 'match rules.[0]: ip_cidr=<binary>\n' : '', stderr: '' });
 		}
 
+		/*
+		 * singbox-nodes：模拟“池子 + 选择 → outbounds”的真实链路。
+		 * 面板不再直接写 config.json 的节点，所以这里必须按脚本的行为模拟，
+		 * 否则测的就不是线上跑的那条路径了。
+		 */
+		if (cmd === '/usr/bin/singbox-nodes') {
+			const act = a[0] || '';
+			const SELP = '/etc/sing-box/nodes.selected.json';
+			const hadSel = SELP in files;
+			const readJson = (p, d) => {
+				try { return JSON.parse(files[p]); } catch (e) { return JSON.parse(JSON.stringify(d)); }
+			};
+
+			const pool = readJson('/etc/sing-box/nodes.pool.json', { nodes: [] });
+			const sel = readJson(SELP, { enabled: [], denied: [], manual: [] });
+			sel.enabled = sel.enabled || [];
+			sel.denied = sel.denied || [];
+			sel.manual = sel.manual || [];
+
+			/* 这里不能用 core.parseJsonc：fakeFs.exec 在 core 之前定义，运行时不在同一作用域 */
+			const parseCfg = (txt) => {
+				let out = '', inStr = false, esc = false;
+
+				for (let i = 0; i < txt.length; i++) {
+					const c = txt[i], n = txt[i + 1];
+
+					if (inStr) {
+						out += c;
+						if (esc) esc = false;
+						else if (c === '\\') esc = true;
+						else if (c === '"') inStr = false;
+						continue;
+					}
+					if (c === '"') { inStr = true; out += c; continue; }
+					if (c === '/' && n === '/') { while (i < txt.length && txt[i] !== '\n') i++; out += '\n'; continue; }
+					if (c === '/' && n === '*') { i += 2; while (i < txt.length && !(txt[i] === '*' && txt[i + 1] === '/')) i++; i++; continue; }
+					out += c;
+				}
+
+				return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+			};
+
+			const saveSel = () => { files[SELP] = JSON.stringify(sel, null, 2); };
+			const PROXY = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2', 'tuic' ];
+			const poolTags = (pool.nodes || []).map(n => n.tag);
+
+			/* 首次迁移：config 里已有、但不属于池子的节点收进 manual，避免被重建抹掉 */
+			const seed = () => {
+				if (hadSel) return;
+				const cfg0 = parseCfg(files['/etc/sing-box/config.json'] || '{}');
+				(cfg0.outbounds || []).forEach(o => {
+					if (PROXY.indexOf(String(o.type).toLowerCase()) < 0) return;
+					if (poolTags.indexOf(o.tag) >= 0) return;
+					if (/YOUR_/.test(JSON.stringify(o))) return;
+					if (!sel.manual.some(m => m.tag === o.tag)) sel.manual.push(o);
+				});
+			};
+
+			if (act === 'on' || act === 'off') {
+				a.slice(1).forEach(t0 => {
+					sel.enabled = sel.enabled.filter(x => x !== t0);
+					sel.denied = sel.denied.filter(x => x !== t0);
+					(act === 'on' ? sel.enabled : sel.denied).push(t0);
+				});
+				saveSel();
+				return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+			}
+
+			if (act === 'auto') {
+				seed();
+
+				const filter = files['/etc/sing-box/subscription.filter'] || '';
+				const keep = [], excl = [];
+				filter.split('\n').forEach(l => {
+					l = l.trim();
+					if (!l || l.charAt(0) === '#') return;
+					if (l.charAt(0) === '!') excl.push(l.slice(1).toLowerCase());
+					else keep.push(l.toLowerCase());
+				});
+
+				(pool.nodes || []).forEach(n => {
+					if (sel.enabled.indexOf(n.tag) >= 0 || sel.denied.indexOf(n.tag) >= 0) return;
+					const nm = n.tag.toLowerCase();
+					const drop = excl.some(k => nm.indexOf(k) >= 0) ||
+						(keep.length > 0 && !keep.some(k => nm.indexOf(k) >= 0));
+					(drop ? sel.denied : sel.enabled).push(n.tag);
+				});
+
+				saveSel();
+				return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+			}
+
+			if (act === 'apply') {
+				seed();
+
+				const nodes = (pool.nodes || [])
+					.filter(n => sel.enabled.indexOf(n.tag) >= 0)
+					.concat(sel.manual);
+
+				if (!nodes.length)
+					return Promise.resolve({ code: 1, stdout: '', stderr: 'ERROR: 启用后没有可用节点' });
+
+				const tags = nodes.map(n => n.tag);
+				const cfg = parseCfg(files['/etc/sing-box/config.json'] || '{}');
+
+				cfg.outbounds = [
+					{ type: 'selector', tag: 'proxy', outbounds: [ 'auto' ].concat(tags), default: 'auto' },
+					{ type: 'urltest', tag: 'auto', outbounds: tags,
+					  url: 'https://cp.cloudflare.com/generate_204', interval: '3m', tolerance: 50 },
+					{ type: 'direct', tag: 'direct', reuse_addr: true }
+				].concat(nodes);
+
+				files['/etc/sing-box/config.json'] = JSON.stringify(cfg, null, 2);
+				saveSel();
+				return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+			}
+
+			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+		}
+
 		if (/pidof$/.test(cmd))
 			return Promise.resolve({ code: 0, stdout: '1234\n', stderr: '' });
 
@@ -531,6 +651,20 @@ function load(name) {
 	console.log('\n[nodes 写入链路]');
 	const nodesView = load('view.singbox.nodes');
 	await nodesView.load();
+
+	/*
+	 * 顺序按真实使用来：先有订阅（池子 + 自动选择），再手工加节点，最后删。
+	 * 以前是直接写 config.json，所以先测 saveNode 也无所谓；现在 config 是生成物，
+	 * 先写池子才符合实际链路。
+	 */
+	await nodesView.applyParsed(0, parsed, true);
+	let after = core.parseJsonc(files['/etc/sing-box/config.json']);
+	check('applyParsed 写入订阅节点', after.outbounds.some(o => o.tag === 'Hy2'));
+	/* 首次重建时会把 config 里原有的、非池子的节点收进 manual，不能被抹掉 */
+	check('applyParsed 不误删已填写的节点', after.outbounds.some(o => o.tag === 'node1'));
+	check('applyParsed 后不再有占位符', core.scanPlaceholders(after).length === 0);
+	check('applyParsed 记录 last_update', nodesView.data.subs.subscriptions[0].count === 6);
+
 	const fakeF = {
 		tag: { value: '手工节点' }, type: { value: 'vless' }, server: { value: 'manual.example.com' },
 		port: { value: '443' }, uuid: { value: '99999999-1111-2222-3333-444444444444' },
@@ -539,22 +673,33 @@ function load(name) {
 		pbk: { value: 'AcSDB92IB-REhNbdYjXb_6PjAVzYkHtbrbYDbSqwQ04' }, sid: { value: 'ab12' },
 		insecure: { checked: false }, obfs: { value: '' }, method: { value: '' }, password: { value: '' }
 	};
+
+	await nodesView.reload();
 	await nodesView.saveNode(fakeF, null);
-	let after = core.parseJsonc(files['/etc/sing-box/config.json']);
+	after = core.parseJsonc(files['/etc/sing-box/config.json']);
 	const added = after.outbounds.filter(o => o.tag === '手工节点')[0];
 	check('saveNode 写入节点', !!added && added.type === 'vless' && added.tls.reality.public_key.length > 0);
 	check('saveNode 同步进 selector', after.outbounds.filter(o => o.tag === 'proxy')[0].outbounds.indexOf('手工节点') >= 0);
 	check('saveNode 同步进 urltest', after.outbounds.filter(o => o.tag === 'auto')[0].outbounds.indexOf('手工节点') >= 0);
+
+	/* 删掉的必须是"手工节点"，订阅节点要走停用而不是删除 */
+	await nodesView.reload();
 	await nodesView.deleteNode('手工节点');
 	after = core.parseJsonc(files['/etc/sing-box/config.json']);
-	check('deleteNode 删掉节点', !after.outbounds.some(o => o.tag === '手工节点'));
-	await nodesView.applyParsed(0, parsed, true);
+	check('deleteNode 删掉手工节点', !after.outbounds.some(o => o.tag === '手工节点'));
+	check('deleteNode 不误伤订阅节点', after.outbounds.some(o => o.tag === 'Hy2'));
+
+	/* 停用订阅节点：写进 denied，之后重新拉订阅也不能把它装回来 */
+	const subTag = (JSON.parse(files['/etc/sing-box/nodes.pool.json']).nodes || [])[0].tag;
+	await nodesView.reload();
+	await nodesView.toggleNode(subTag, false);
 	after = core.parseJsonc(files['/etc/sing-box/config.json']);
-	check('applyParsed 写入订阅节点', after.outbounds.some(o => o.tag === 'Hy2'));
-	/* 模拟环境里演示节点已被填成合法值，所以这里验证的是"不会误删用户已填的节点" */
-	check('applyParsed 不误删已填写的节点', after.outbounds.some(o => o.tag === 'node1'));
-	check('applyParsed 后不再有占位符', core.scanPlaceholders(after).length === 0);
-	check('applyParsed 记录 last_update', nodesView.data.subs.subscriptions[0].count === 6);
+	check('停用后不再出现在配置里', !after.outbounds.some(o => o.tag === subTag));
+	check('停用写进 denied', JSON.parse(files['/etc/sing-box/nodes.selected.json']).denied.indexOf(subTag) >= 0);
+
+	await nodesView.applyParsed(0, parsed, true);   /* 等价于定时任务又拉了一次订阅 */
+	after = core.parseJsonc(files['/etc/sing-box/config.json']);
+	check('订阅刷新不会复活已停用的节点', !after.outbounds.some(o => o.tag === subTag));
 
 	/* ---------- 规则集更新：下载 + 四道校验 ---------- */
 	const RS = '/etc/sing-box/rule-set/geoip-cn.srs';

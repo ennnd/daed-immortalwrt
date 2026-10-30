@@ -19,10 +19,15 @@ var TYPE_FIELDS = {
 
 return view.extend({
 	load: function() {
-		return Promise.all([ api.readConfig(), this.loadSubs(), api.status() ])
-			.then(function(r) {
-				return { cfg: r[0].cfg, error: r[0].error, text: r[0].text, subs: r[1], st: r[2] };
-			});
+		return Promise.all([
+			api.readConfig(), this.loadSubs(), api.status(),
+			api.readPool(), api.readSelection()
+		]).then(function(r) {
+			return {
+				cfg: r[0].cfg, error: r[0].error, text: r[0].text, subs: r[1], st: r[2],
+				pool: r[3], sel: r[4]
+			};
+		});
 	},
 
 	loadSubs: function() {
@@ -68,13 +73,18 @@ return view.extend({
 	reload: function() {
 		var self = this;
 
-		return Promise.all([ api.readConfig(), this.loadSubs() ]).then(function(r) {
+		return Promise.all([
+			api.readConfig(), this.loadSubs(),
+			api.readPool(), api.readSelection()
+		]).then(function(r) {
 			self.data = {
 				cfg: r[0].cfg,
 				error: r[0].error,
 				text: r[0].text,
 				subs: r[1],
-				st: self.data.st
+				st: self.data.st,
+				pool: r[2],
+				sel: r[3]
 			};
 
 			self.redraw();
@@ -85,8 +95,71 @@ return view.extend({
 		while (this.bodyNode.firstChild)
 			this.bodyNode.removeChild(this.bodyNode.firstChild);
 
+		this.bodyNode.appendChild(this.buildPool(this.data));
 		this.bodyNode.appendChild(this.buildNodes(this.data));
 		this.bodyNode.appendChild(this.buildSubs(this.data));
+	},
+
+	/* ---------------- 订阅节点池 ---------------- */
+
+	/*
+	 * 池子里是订阅里的全部节点，这里是唯一决定“用哪几个”的地方。
+	 * 面板只写 nodes.selected.json，再让 singbox-nodes 重建 outbounds ——
+	 * 不直接改 config.json，这样定时任务刷新订阅时不会把手动停用的节点装回来。
+	 */
+	buildPool: function(data) {
+		var self = this;
+		var pool = (data.pool && data.pool.nodes) || [];
+		var enabled = (data.sel && data.sel.enabled) || [];
+		var denied  = (data.sel && data.sel.denied)  || [];
+
+		var rows = pool.map(function(n) {
+			var on = enabled.indexOf(n.tag) >= 0;
+			var decided = on || denied.indexOf(n.tag) >= 0;
+
+			return [
+				E('span', { 'style': 'word-break:break-all' }, n.tag),
+				n.type,
+				core.outboundSummary(n) || '—',
+				on ? E('b', {}, _('启用'))
+				   : E('span', { 'style': 'opacity:.6' }, decided ? _('停用') : _('未决定')),
+				sbui.btn(on ? _('停用') : _('启用'),
+					on ? 'cbi-button-reset' : 'cbi-button-action',
+					sbui.action(function() {
+						return self.toggleNode(n.tag, !on);
+					}))
+			];
+		});
+
+		var upd = (data.pool && data.pool.updated) ? sbui.fmtTime(data.pool.updated * 1000) : _('从未更新');
+
+		return sbui.card(_('订阅节点池') + ' (' + pool.length + ')', [
+			sbui.table([ _('名称'), _('类型'), _('地址 / 参数'), _('状态'), _('操作') ], rows,
+				_('节点池是空的。先在下面添加订阅并点「立即更新」，或等定时任务拉取。')),
+			sbui.hint(_('订阅只负责把节点放进池子，这里决定用哪几个。停用后会记住，订阅刷新不会再装回来。池子更新时间：') + upd)
+		]);
+	},
+
+	toggleNode: function(tag, on) {
+		var self = this;
+
+		return api.readSelection().then(function(sel) {
+			sel.enabled = sel.enabled.filter(function(t) { return t !== tag; });
+			sel.denied  = sel.denied.filter(function(t) { return t !== tag; });
+
+			if (on)
+				sel.enabled.push(tag);
+			else
+				sel.denied.push(tag);
+
+			return api.writeSelection(sel);
+		}).then(function() {
+			return api.nodesCmd([ 'apply' ]);
+		}).then(function() {
+			return self.reload();
+		}).then(function() {
+			sbui.notifyOk(on ? _('已启用并应用') : _('已停用并应用'));
+		});
 	},
 
 	/* ---------------- 节点 ---------------- */
@@ -130,14 +203,16 @@ return view.extend({
 				})));
 		}
 
-		var card = sbui.card(_('节点') + ' (' + nodes.length + ')', [
+		var card = sbui.card(_('当前生效的节点') + ' (' + nodes.length + ')', [
 			ph.length
 				? sbui.warn(_('这些节点还是出厂演示值，sing-box 会拒绝启动：') + core.placeholderText(ph))
 				: '',
 			sbui.table([ _('名称'), _('类型'), _('地址 / 参数'), _('操作') ], rows,
 				_('还没有节点。可以手工添加，或在下面粘贴订阅链接批量导入。')),
 			E('div', { 'style': 'margin-top:1em' }, actions),
-			sbui.hint(_('这里的每个改动都会重写 /etc/sing-box/config.json：先备份到 backup/，再 sing-box check，通过后才替换并重启。注释会丢。'))
+			sbui.hint(_('这一栏是最终写进 config.json 的节点，由「订阅节点池」的启用状态 + 手工节点合成，') +
+				_('由 /usr/bin/singbox-nodes 生成（check 通过才替换，失败自动回滚）。') +
+				_('订阅节点请在上面启用/停用，不要在这里改。'))
 		]);
 
 		return card;
@@ -362,34 +437,43 @@ return view.extend({
 
 		var self = this;
 
-		return api.readConfig().then(function(r) {
-			if (r.error)
-				throw new Error(_('当前 config.json 不是合法 JSON：') + r.error);
+		/* 手工节点写进 selected.manual，config.json 由 singbox-nodes 统一生成 */
+		return api.readPool().then(function(pool) {
+			var inPool = (pool.nodes || []).some(function(n) { return n.tag === tag; });
 
-			var res = core.mergeNodes(r.cfg, [ node ], { syncMembers: true });
+			if (inPool)
+				throw new Error(_('这个节点来自订阅，不能直接编辑。请改订阅内容，或用「启用 / 停用」控制它。'));
 
-			return api.saveConfig(r.cfg, _('保存节点') + ' ' + tag).then(function() {
-				return res;
-			});
+			return api.readSelection();
+		}).then(function(sel) {
+			sel.manual = (sel.manual || []).filter(function(n) { return n.tag !== tag; });
+			sel.manual.push(node);
+
+			return api.writeSelection(sel);
+		}).then(function() {
+			return api.nodesCmd([ 'apply' ]);
 		});
 	},
 
 	deleteNode: function(tag) {
 		var self = this;
+		var inPool = ((this.data.pool && this.data.pool.nodes) || []).some(function(n) { return n.tag === tag; });
 
-		if (!confirm(_('确定删除节点 ') + tag + _(' 吗？')))
+		if (!confirm(inPool
+			? _('确定停用节点 ') + tag + _(' 吗？它会留在订阅池里，随时可以再启用。')
+			: _('确定删除手工节点 ') + tag + _(' 吗？')))
 			return Promise.resolve();
 
-		return api.readConfig().then(function(r) {
-			if (r.error)
-				throw new Error(_('当前 config.json 不是合法 JSON：') + r.error);
+		/* 订阅节点走“停用”，手工节点才真的删 —— 否则下次订阅刷新又会长回来 */
+		if (inPool)
+			return this.toggleNode(tag, false);
 
-			var res = core.removeOutbound(r.cfg, tag);
+		return api.readSelection().then(function(sel) {
+			sel.manual = sel.manual.filter(function(n) { return n.tag !== tag; });
 
-			if (!res.removed)
-				throw new Error(res.fixes.join('; ') || _('没找到这个节点'));
-
-			return api.saveConfig(r.cfg, _('删除节点') + ' ' + tag);
+			return api.writeSelection(sel);
+		}).then(function() {
+			return api.nodesCmd([ 'apply' ]);
 		}).then(function() {
 			return self.reload();
 		}).then(function() {
@@ -563,45 +647,47 @@ return view.extend({
 
 	applyParsed: function(idx, parsed, syncMembers) {
 		var self = this;
+		var incoming = (parsed && parsed.nodes) || [];
+		var added = [], replaced = [];
 
-		return api.readConfig().then(function(r) {
-			if (r.error)
-				throw new Error(_('当前 config.json 不是合法 JSON：') + r.error);
+		/* 订阅只更新池子：同 tag 覆盖，新 tag 追加。用不用由选择状态决定。 */
+		return api.readPool().then(function(pool) {
+			var nodes = (pool.nodes || []).slice();
+			var idxOf = {};
 
-			var res = core.mergeNodes(r.cfg, parsed.nodes, { syncMembers: syncMembers !== false });
+			nodes.forEach(function(n, i) { idxOf[n.tag] = i; });
 
-			/*
-			 * 导入时顺手清掉没填写的出厂演示节点。留着它们的话，
-			 * 配置依然会因为 invalid public_key 无法启动——这就是导入成功、
-			 * 点启用却报 FATAL initialize outbound[2] 的典型原因。
-			 */
-			var demo = core.scanPlaceholders(r.cfg).filter(function(p) {
-				return p.where === 'outbound' && p.tag;
+			incoming.forEach(function(n) {
+				if (idxOf[n.tag] != null) {
+					nodes[idxOf[n.tag]] = n;
+					replaced.push(n.tag);
+				}
+				else {
+					idxOf[n.tag] = nodes.length;
+					nodes.push(n);
+					added.push(n.tag);
+				}
 			});
 
-			if (demo.length) {
-				demo.forEach(function(p) {
-					core.removeOutbound(r.cfg, p.tag);
-				});
+			return api.writePool(nodes);
+		}).then(function() {
+			/* 新节点按 subscription.filter 定默认值；已经选择过的节点不受影响 */
+			return api.nodesCmd([ 'auto' ]);
+		}).then(function() {
+			return api.nodesCmd([ 'apply' ]);
+		}).then(function() {
+			self.data.subs.settings.sync_members = syncMembers !== false;
 
-				core.normalizeMembers(r.cfg);
-				res.removedDemo = demo.map(function(p) { return p.tag; });
+			var sub = self.data.subs.subscriptions[idx];
+
+			if (sub) {
+				sub.last_update = Date.now();
+				sub.count = incoming.length;
 			}
 
-			return api.saveConfig(r.cfg, _('订阅更新')).then(function() {
-				self.data.subs.settings.sync_members = syncMembers !== false;
-
-				var sub = self.data.subs.subscriptions[idx];
-
-				if (sub) {
-					sub.last_update = Date.now();
-					sub.count = parsed.nodes.length;
-				}
-
-				return self.saveSubs(self.data.subs);
-			}).then(function() {
-				return res;
-			});
+			return self.saveSubs(self.data.subs);
+		}).then(function() {
+			return { added: added, replaced: replaced, removedDemo: [], fixes: [] };
 		});
 	},
 

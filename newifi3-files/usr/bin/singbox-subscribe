@@ -12,14 +12,18 @@
 #
 # 依赖文件：
 #   /etc/sing-box/subscription.url      订阅链接（600，勿入库）
-#   /etc/sing-box/subscription.filter   关键字筛选，一行一个：
-#                                         IEPL          保留名字含 IEPL 的
-#                                         !过期         丢掉名字含“过期”的
-#                                         #@min 2       白名单少于 2 个可用时允许补位
-#                                       规则：只要写了任一“保留关键字”，就只留命中这些关键字的
-#                                       节点（白名单）；以 ! 开头的是排除项，优先级最高；
-#                                       #@min N 控制兜底：白名单可用节点少于 N 个时，从其余
-#                                       节点按订阅顺序补足，写 0 表示严格白名单、宁缺不补。
+#   /etc/sing-box/nodes.pool.json       输出：订阅里的全部节点（本脚本只写这个）
+#   /etc/sing-box/subscription.filter   新节点的默认取舍规则，一行一个：
+#                                         c17s2         白名单，只默认启用命中这些的
+#                                         !过期         默认停用命中这些的
+#                                         #@min 2       启用数少于 2 个时允许补位
+#                                       只对“你还没明确选择过”的节点生效；在面板里
+#                                       勾过的节点不会被这里覆盖。
+#
+# 分工（重要）：本脚本不写 config.json。它只负责把节点放进池子，然后调用
+#   singbox-nodes auto    给未决定的新节点定默认值
+#   singbox-nodes apply   按选择状态生成 outbounds 并生效
+# 这样面板和定时任务不会互相覆盖。
 #
 # 安全：订阅链接等同于账号密码，脚本不会把它写进日志。
 #
@@ -32,9 +36,13 @@ set -u
 CONF=${SINGBOX_SUB_CONF:-/etc/sing-box/config.json}
 URLF=${SINGBOX_SUB_URL_FILE:-/etc/sing-box/subscription.url}
 FILTF=${SINGBOX_SUB_FILTER:-/etc/sing-box/subscription.filter}
+POOL=${SINGBOX_POOL:-/etc/sing-box/nodes.pool.json}
+SEL=${SINGBOX_SEL:-/etc/sing-box/nodes.selected.json}
+NODES_BIN=${SINGBOX_NODES_BIN:-/usr/bin/singbox-nodes}
 WORK=/tmp/sb-sub
 TAG=singbox-subscribe
 MAX_NODES=32
+export SINGBOX_POOL="$POOL" SINGBOX_SEL="$SEL" SINGBOX_SUB_CONF="$CONF" SINGBOX_SUB_FILTER="$FILTF"
 UA="sing-box/1.14.3"
 
 DRY=0
@@ -318,124 +326,19 @@ fi
 
 [ "$parsed" -gt 0 ] || die "一个节点都没解析出来（共跳过 $skipped 个不支持的协议）"
 
-# ---------------------------------------------------------------- 关键字筛选
-# 规则：
-#   关键字    保留（写成白名单后只留命中的那几个）
-#   !关键字   排除，优先级最高
-#   #@min N   兜底阈值：白名单里活着的节点少于 N 个时，允许从其余节点按订阅
-#             顺序补充到 N 个；写 0 = 严格白名单，宁缺不补。默认 2。
-keep_re=""
-excl_re=""
-min_pool=2
+# ---------------------------------------------------------------- 写节点池
+# 池子里放“订阅里有的全部节点”，不做取舍 —— 取舍属于用户的选择，记在
+# nodes.selected.json 里，由 singbox-nodes 统一处理。这样两个入口不再互相覆盖：
+#   订阅刷新  -> 只改池子
+#   面板勾选  -> 只改选择状态
+#   config.json -> 只由 singbox-nodes 生成
 
-if [ -s "$FILTF" ]; then
-	while IFS= read -r kw; do
-		kw=$(printf '%s' "$kw" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-		[ -n "$kw" ] || continue
-		case "$kw" in
-			'#@min '*)
-				v=$(printf '%s' "${kw#\#@min }" | tr -d ' ')
-				case "$v" in ''|*[!0-9]*) ;; *) min_pool="$v" ;; esac
-				continue ;;
-		esac
-		case "$kw" in \#*) continue ;; esac
-		case "$kw" in
-			!*) excl_re="${excl_re}|$(printf '%s' "${kw#!}" | tr 'A-Z' 'a-z')" ;;
-			*)  keep_re="${keep_re}|$(printf '%s' "$kw" | tr 'A-Z' 'a-z')" ;;
-		esac
-	done < "$FILTF"
-fi
-
-keep_re=${keep_re#|}
-excl_re=${excl_re#|}
-
-filtered="$WORK/filtered.ndjson"
-others="$WORK/others.ndjson"
-: > "$filtered"
-: > "$others"
-n_keep=0
-n_drop=0
-n_spare=0
-
-while IFS= read -r line; do
-	[ -n "$line" ] || continue
-	name=$(printf '%s' "$line" | jq -r '.tag // ""' 2>/dev/null | tr 'A-Z' 'a-z')
-
-	if [ -n "$excl_re" ] && printf '%s' "$name" | grep -qE "$excl_re"; then
-		n_drop=$((n_drop + 1)); continue
-	fi
-
-	if [ -n "$keep_re" ]; then
-		if printf '%s' "$name" | grep -qE "$keep_re"; then
-			n_keep=$((n_keep + 1))
-		else
-			# 没命中白名单：不算丢弃，先存起来当备用（白名单全坏时才会用到）
-			n_spare=$((n_spare + 1))
-			printf '%s\n' "$line" >> "$others"
-			continue
-		fi
-	fi
-
-	printf '%s\n' "$line" >> "$filtered"
-done < "$nodes"
-
-total=$(wc -l < "$filtered" | tr -d ' ')
-[ "$total" -gt 0 ] || die "筛选后没有节点（保留规则: ${keep_re:-无}，排除: ${excl_re:-无}）"
-
-# 跳过 nodecheck 近期判定为坏的节点（TTL 内不复活），否则每次刷新都会把刚踢掉的装回来
-DEADF=/etc/sing-box/dead-nodes
-: > "$WORK/dead.txt"
-if [ -s "$DEADF" ]; then
-	now=$(date +%s)
-	awk -F'\t' -v ttl=21600 -v now="$now" 'NF==2 && (now - $2) < ttl { print $1 }' "$DEADF" > "$WORK/dead.txt"
-fi
-
-# 去掉 dead 名单里的节点，输出存活行数
-drop_dead() {
-	_in=$1; _out=$2
-	: > "$_out"
-	if [ -s "$WORK/dead.txt" ]; then
-		while IFS= read -r line; do
-			_t=$(printf '%s' "$line" | jq -r '.tag // ""' 2>/dev/null)
-			if grep -qxF "$_t" "$WORK/dead.txt"; then
-				n_drop=$((n_drop + 1))
-			else
-				printf '%s\n' "$line" >> "$_out"
-			fi
-		done < "$_in"
-	else
-		cp "$_in" "$_out"
-	fi
-	wc -l < "$_out" | tr -d ' '
-}
-
-alive=$(drop_dead "$filtered" "$WORK/kept.ndjson")
-relaxed=0
-
-# 白名单里的节点不够用了（被踢掉或失效），从备用里按订阅顺序补足到 min_pool 个，
-# 否则“白名单 4 个全挂”时订阅再怎么刷新也只会拉回这 4 个，等于没有兜底。
-if [ "$min_pool" -gt 0 ] && [ "$alive" -lt "$min_pool" ] && [ -s "$others" ]; then
-	spare_alive=$(drop_dead "$others" "$WORK/others.alive")
-	if [ "$spare_alive" -gt 0 ]; then
-		relaxed=$((min_pool - alive))
-		head -n "$relaxed" "$WORK/others.alive" >> "$WORK/kept.ndjson"
-		alive=$(wc -l < "$WORK/kept.ndjson" | tr -d ' ')
-	fi
-fi
-
-if [ "$alive" -gt 0 ]; then
-	mv "$WORK/kept.ndjson" "$filtered"
-	total=$alive
-else
-	# 白名单和备用全在 dead 名单里：保留原节点，别写出空配置让 sing-box 起不来
-	total=$(wc -l < "$filtered" | tr -d ' ')
-	log "所有节点都在 dead 名单内（TTL 6 小时），本次沿用原有 $total 个节点"
-fi
+total_raw=$(wc -l < "$nodes" | tr -d ' ')
 
 # 超过上限则截断（顺序即订阅顺序，机场通常把好节点排前面）
-if [ "$total" -gt "$MAX_NODES" ]; then
-	head -n "$MAX_NODES" "$filtered" > "$filtered.tmp" && mv "$filtered.tmp" "$filtered"
-	total=$MAX_NODES
+if [ "$total_raw" -gt "$MAX_NODES" ]; then
+	head -n "$MAX_NODES" "$nodes" > "$WORK/nodes.cap" && mv "$WORK/nodes.cap" "$nodes"
+	total_raw=$MAX_NODES
 fi
 
 # tag 去重：同名节点加序号，否则 sing-box 会因 tag 冲突拒绝启动
@@ -446,109 +349,36 @@ jq -s '
 		| .seen[$base] = ($c + 1)
 		| .out += [ $n + { tag: (if $c == 0 then $base else ($base + " #" + (($c + 1) | tostring)) end) } ]
 	) | .out
-' "$filtered" > "$WORK/nodes.json" 2>/dev/null || die "节点 JSON 合并失败"
+' "$nodes" > "$WORK/nodes.json" 2>/dev/null || die "节点 JSON 合并失败"
 
-[ "$LIST" = "1" ] && { jq -r '.[].tag' "$WORK/nodes.json"; exit 0; }
+total=$(jq 'length' "$WORK/nodes.json")
+[ "$total" -gt 0 ] || die "订阅里没有解析出任何节点"
 
-if [ "$DRY" = "1" ]; then
-	echo "格式=$mode  解析=$parsed  跳过=$skipped  保留=$total  丢弃=$n_drop  备用=$n_spare  补位=$relaxed"
-	echo "--- 节点列表 ---"
+if [ "$LIST" = "1" ]; then
 	jq -r '.[].tag' "$WORK/nodes.json"
 	exit 0
 fi
 
-# ---------------------------------------------------------------- 生成 outbounds
-# 注意 reuse_addr：direct 出站必须带这个字段，否则 sing-box 启动时会把
-# DNS 的 "detour": "direct" 判成「detour to an empty direct outbound」直接 FATAL。
-# 这个错误 sing-box check 查不出来，只有真正启动才暴露 —— 所以下面还要做健康检查。
-jq '
-	(map(.tag)) as $tags
-	| [ { type: "selector", tag: "proxy",
-	      outbounds: (["auto"] + $tags), default: "auto" },
-	    { type: "urltest", tag: "auto",
-	      outbounds: $tags,
-	      url: "https://cp.cloudflare.com/generate_204",
-	      interval: "3m", tolerance: 50 },
-	    { type: "direct", tag: "direct", reuse_addr: true } ] + .
-' "$WORK/nodes.json" > "$WORK/outbounds.json" || die "生成 outbounds 失败"
+jq --argjson ts "$(date +%s)" '{ updated: $ts, nodes: . }' "$WORK/nodes.json" > "$WORK/pool.preview.json" \
+	|| die "生成节点池失败"
 
-# 去掉最外层 [ ]，其余缩进正好落进 config 的 outbounds 数组（补 2 空格对齐）
-jq . < "$WORK/outbounds.json" | sed '1d;$d' | sed 's/^/  /' > "$WORK/ob.txt"
-
-# 拼接：标记前 + 新节点 + 标记后
-# 标记可能不存在 —— LuCI 面板保存配置时会重新序列化 JSON，注释（含标记）会丢。
-# 那种情况下退化成“整体重写 outbounds”，功能等价，只是注释没了。
-if grep -q '>>> NODES BEGIN' "$CONF" && grep -q '<<< NODES END' "$CONF"; then
-	sed -n '1,/>>> NODES BEGIN/p' "$CONF" > "$WORK/config.new"
-	cat "$WORK/ob.txt" >> "$WORK/config.new"
-	sed -n '/<<< NODES END/,$p' "$CONF" >> "$WORK/config.new"
-else
-	sed '/^[[:space:]]*\/\//d' "$CONF" > "$WORK/conf.json" || die "读取配置失败"
-	jq --slurpfile ob "$WORK/outbounds.json" '.outbounds = $ob[0]' "$WORK/conf.json" > "$WORK/config.new" \
-		|| die "重写配置失败"
-fi
-
-# 节点完全没变就不重启，避免每 6 小时把连接打断一次。
-# 比的是“规范化后的 outbounds 数组”哈希，两种拼接方式都适用。
-new_md5=$(jq -c . "$WORK/outbounds.json" | md5sum | cut -d' ' -f1)
-cur_md5=$(sed '/^[[:space:]]*\/\//d' "$CONF" | jq -c '.outbounds' 2>/dev/null | md5sum | cut -d' ' -f1)
-if [ "$new_md5" = "$cur_md5" ]; then
-	log "节点无变化（$total 个），跳过重启"
+if [ "$DRY" = "1" ]; then
+	echo "格式=$mode  解析=$parsed  跳过=$skipped  池中节点=$total"
+	echo "--- 池中全部节点 ---"
+	jq -r '.[].tag' "$WORK/nodes.json"
+	echo "--- 按筛选规则给「未决定」节点的默认值 ---"
+	SINGBOX_POOL="$WORK/pool.preview.json" "$NODES_BIN" -n auto 2>&1 | sed 's/^/  /'
 	exit 0
 fi
 
-sing-box check -c "$WORK/config.new" >/dev/null 2>&1 \
-	|| { sing-box check -c "$WORK/config.new" 2>&1 | tail -5; die "新配置校验失败，已放弃（原配置未改动）"; }
+[ -x "$NODES_BIN" ] || die "缺少 $NODES_BIN（节点池生成器未安装）"
 
-cp "$CONF" "$CONF.bak.subscribe"
-cp "$WORK/config.new" "$CONF"
+mv "$WORK/pool.preview.json" "$POOL" || die "写节点池失败"
+chmod 600 "$POOL" 2>/dev/null
+log "节点池已更新：$total 个节点"
 
-log "已更新 $total 个节点（解析 $parsed，跳过 $skipped，筛掉 $n_drop，备用 $n_spare，补位 $relaxed）"
-
-# ---------------------------------------------------------------- 生效
-# 回滚：配置语法对、进程也能起来，不代表能用 —— 参数写错（比如漏了 reuse_addr）
-# 会表现为启动即 FATAL 崩溃循环，或起来了但一个节点都连不上。所以必须实测。
-
-rollback() {
-	cp "$CONF.bak.subscribe" "$CONF"
-	/etc/init.d/sing-box restart >/dev/null 2>&1
-	rm -f /tmp/.sb_wd_seen
-	die "$1（已回滚到上一版配置）"
-}
-
-health_ok() {
-	i=0
-	while [ "$i" -lt 5 ]; do
-		out=$(wget -O /dev/null -T 8 https://cp.cloudflare.com/generate_204 2>&1)
-		case "$out" in
-			*"0 bytes"*) return 0 ;;
-		esac
-		sleep 4
-		i=$((i + 1))
-	done
-	return 1
-}
-
-if pidof sing-box >/dev/null 2>&1; then
-	rm -f /tmp/.sb_wd_seen            # 重启后给看门狗重新计时，避免刚起来就被判死
-	/etc/init.d/sing-box restart >/dev/null 2>&1
-	sleep 4
-
-	# 崩溃循环时 pid 会一闪而过，光看 pidof 会误判，这里连续观察 6 秒
-	stable=1
-	i=0
-	while [ "$i" -lt 6 ]; do
-		pidof sing-box >/dev/null 2>&1 || { stable=0; break; }
-		sleep 1
-		i=$((i + 1))
-	done
-	[ "$stable" = "1" ] || rollback "sing-box 启动后不稳定（崩溃循环）"
-
-	health_ok || rollback "新节点实测不通（204 探测连续失败）"
-
-	log "sing-box 已重启并通过连通性检查（pid $(pidof sing-box)）"
-else
-	log "sing-box 当前未运行，配置已更新，下次启用时生效"
-fi
+# 给“还没被选择过”的节点定默认值，再按选择状态重建 config.json 并生效
+"$NODES_BIN" auto  || die "自动选择失败"
+"$NODES_BIN" apply || die "生成配置失败"
 
 exit 0

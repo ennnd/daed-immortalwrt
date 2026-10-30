@@ -13,6 +13,7 @@ CFG=/etc/sing-box/config.json
 # 热插拔脚本同理（iface 事件直接不触发）。每次启用时顺手补回。
 chmod 755 /usr/bin/singbox-on /usr/bin/singbox-off /usr/bin/singbox-safestop \
           /usr/bin/singbox-watchdog /usr/bin/singbox-subscribe /usr/bin/singbox-nodecheck \
+          /usr/bin/singbox-nodes \
           /etc/hotplug.d/iface/99-singbox 2>/dev/null || true
 
 if grep -q '"YOUR_' "$CFG"; then

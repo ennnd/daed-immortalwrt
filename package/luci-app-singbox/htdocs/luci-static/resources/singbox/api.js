@@ -290,6 +290,87 @@ api.saveConfig = function(cfg, note) {
 	return api.saveText(JSON.stringify(cfg, null, 2) + '\n', note);
 };
 
+/* ---------------- 节点池与选择状态 ----------------
+ *
+ * 分层（与 /usr/bin/singbox-nodes 完全一致）：
+ *   nodes.pool.json      订阅里的全部节点，只由拉取动作写入，不做取舍
+ *   nodes.selected.json  用户选择 { enabled, denied, manual }
+ *   config.json          outbounds 是生成物，只由 singbox-nodes 生成
+ *
+ * 面板不再直接改 config.json 里的节点列表：它只改选择状态，再让生成器重建。
+ * 否则面板里删掉的节点，下一次订阅刷新会被重新装回来 —— 这正是以前的老问题。
+ */
+var POOL = '/etc/sing-box/nodes.pool.json';
+var SEL = '/etc/sing-box/nodes.selected.json';
+var NODES_BIN = '/usr/bin/singbox-nodes';
+
+api.readPool = function() {
+	return fs.read(POOL).then(function(text) {
+		var o = null;
+
+		try { o = JSON.parse(text); } catch (e) { o = null; }
+
+		if (!o || !Array.isArray(o.nodes))
+			o = { updated: 0, nodes: [] };
+
+		return o;
+	}).catch(function() {
+		return { updated: 0, nodes: [] };
+	});
+};
+
+api.writePool = function(nodes) {
+	var text = JSON.stringify({
+		updated: Math.floor(Date.now() / 1000),
+		nodes: nodes || []
+	}, null, 2) + '\n';
+
+	return fs.write(POOL, text);
+};
+
+api.readSelection = function() {
+	return fs.read(SEL).then(function(text) {
+		var o = null;
+
+		try { o = JSON.parse(text); } catch (e) { o = null; }
+
+		if (!o || typeof o !== 'object')
+			o = {};
+
+		if (!Array.isArray(o.enabled)) o.enabled = [];
+		if (!Array.isArray(o.denied))  o.denied  = [];
+		if (!Array.isArray(o.manual))  o.manual  = [];
+
+		return o;
+	}).catch(function() {
+		return { enabled: [], denied: [], manual: [] };
+	});
+};
+
+api.writeSelection = function(sel) {
+	var text = JSON.stringify({
+		enabled: sel.enabled || [],
+		denied:  sel.denied  || [],
+		manual:  sel.manual  || []
+	}, null, 2) + '\n';
+
+	return fs.write(SEL, text);
+};
+
+/* 调用生成器：apply / auto / on TAG / off TAG */
+api.nodesCmd = function(args) {
+	return api.exec(NODES_BIN, args).then(function(res) {
+		if (res.code !== 0) {
+			var msg = core.trimStr((res.stderr || '') + ' ' + (res.stdout || ''))
+				.replace(/^ERROR:\s*/i, '');
+
+			throw new Error(msg || _('节点操作失败'));
+		}
+
+		return res;
+	});
+};
+
 /*
  * 恢复出厂：优先用 /rom 里的原件（squashfs 只读层，永远干净），
  * 退回 /etc/sing-box/config.default.json。写入仍然走 saveText（会先备份再 check）。
