@@ -101,4 +101,32 @@ CRON
   /etc/init.d/cron enable 2>/dev/null
   /etc/init.d/cron restart 2>/dev/null
 fi
+
+# 订阅筛选规则的默认模板（已存在则不覆盖，重刷固件不会冲掉你定制过的白名单）
+if [ ! -f /etc/sing-box/subscription.filter ]; then
+  mkdir -p /etc/sing-box
+  cat > /etc/sing-box/subscription.filter <<'FILT'
+# 节点筛选规则（singbox-subscribe 读取）
+#
+# 写法：
+#   关键字      白名单。写了任意一条，订阅里只有命中这些关键字的节点会被启用
+#   !关键字     排除，优先级最高，命中即丢
+#   #@min N     兜底。白名单里可用的节点少于 N 个时，从其余节点按订阅顺序补足，
+#               保证节点全挂时不至于一个都不剩；写 0 = 严格白名单，宁缺不补
+#
+# 例：只想用订阅里的 c17s2/c17s3 两个节点
+#   c17s2
+#   c17s3
+#   #@min 1
+#
+# 注意：在 LuCI 面板里手动删掉的节点，下一次订阅刷新（每 6 小时）会被重新装回来。
+# 永久不用某个节点，请在这里用 ! 关键字排除，或写成白名单。
+!剩余流量
+!过期
+!官网
+!订阅
+#@min 2
+FILT
+  chmod 600 /etc/sing-box/subscription.filter
+fi
 exit 0

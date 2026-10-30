@@ -15,8 +15,11 @@
 #   /etc/sing-box/subscription.filter   关键字筛选，一行一个：
 #                                         IEPL          保留名字含 IEPL 的
 #                                         !过期         丢掉名字含“过期”的
+#                                         #@min 2       白名单少于 2 个可用时允许补位
 #                                       规则：只要写了任一“保留关键字”，就只留命中这些关键字的
-#                                       节点；以 ! 开头的是排除项，优先级最高。
+#                                       节点（白名单）；以 ! 开头的是排除项，优先级最高；
+#                                       #@min N 控制兜底：白名单可用节点少于 N 个时，从其余
+#                                       节点按订阅顺序补足，写 0 表示严格白名单、宁缺不补。
 #
 # 安全：订阅链接等同于账号密码，脚本不会把它写进日志。
 #
@@ -316,14 +319,25 @@ fi
 [ "$parsed" -gt 0 ] || die "一个节点都没解析出来（共跳过 $skipped 个不支持的协议）"
 
 # ---------------------------------------------------------------- 关键字筛选
-# 规则：有任一“保留”关键字时只留命中的；!开头为排除，优先级最高
+# 规则：
+#   关键字    保留（写成白名单后只留命中的那几个）
+#   !关键字   排除，优先级最高
+#   #@min N   兜底阈值：白名单里活着的节点少于 N 个时，允许从其余节点按订阅
+#             顺序补充到 N 个；写 0 = 严格白名单，宁缺不补。默认 2。
 keep_re=""
 excl_re=""
+min_pool=2
 
 if [ -s "$FILTF" ]; then
 	while IFS= read -r kw; do
 		kw=$(printf '%s' "$kw" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
 		[ -n "$kw" ] || continue
+		case "$kw" in
+			'#@min '*)
+				v=$(printf '%s' "${kw#\#@min }" | tr -d ' ')
+				case "$v" in ''|*[!0-9]*) ;; *) min_pool="$v" ;; esac
+				continue ;;
+		esac
 		case "$kw" in \#*) continue ;; esac
 		case "$kw" in
 			!*) excl_re="${excl_re}|$(printf '%s' "${kw#!}" | tr 'A-Z' 'a-z')" ;;
@@ -336,9 +350,12 @@ keep_re=${keep_re#|}
 excl_re=${excl_re#|}
 
 filtered="$WORK/filtered.ndjson"
+others="$WORK/others.ndjson"
 : > "$filtered"
+: > "$others"
 n_keep=0
 n_drop=0
+n_spare=0
 
 while IFS= read -r line; do
 	[ -n "$line" ] || continue
@@ -352,7 +369,10 @@ while IFS= read -r line; do
 		if printf '%s' "$name" | grep -qE "$keep_re"; then
 			n_keep=$((n_keep + 1))
 		else
-			n_drop=$((n_drop + 1)); continue
+			# 没命中白名单：不算丢弃，先存起来当备用（白名单全坏时才会用到）
+			n_spare=$((n_spare + 1))
+			printf '%s\n' "$line" >> "$others"
+			continue
 		fi
 	fi
 
@@ -364,27 +384,53 @@ total=$(wc -l < "$filtered" | tr -d ' ')
 
 # 跳过 nodecheck 近期判定为坏的节点（TTL 内不复活），否则每次刷新都会把刚踢掉的装回来
 DEADF=/etc/sing-box/dead-nodes
+: > "$WORK/dead.txt"
 if [ -s "$DEADF" ]; then
 	now=$(date +%s)
 	awk -F'\t' -v ttl=21600 -v now="$now" 'NF==2 && (now - $2) < ttl { print $1 }' "$DEADF" > "$WORK/dead.txt"
+fi
+
+# 去掉 dead 名单里的节点，输出存活行数
+drop_dead() {
+	_in=$1; _out=$2
+	: > "$_out"
 	if [ -s "$WORK/dead.txt" ]; then
-		: > "$filtered.alive"
 		while IFS= read -r line; do
-			t=$(printf '%s' "$line" | jq -r '.tag // ""' 2>/dev/null)
-			if grep -qxF "$t" "$WORK/dead.txt"; then
+			_t=$(printf '%s' "$line" | jq -r '.tag // ""' 2>/dev/null)
+			if grep -qxF "$_t" "$WORK/dead.txt"; then
 				n_drop=$((n_drop + 1))
 			else
-				printf '%s\n' "$line" >> "$filtered.alive"
+				printf '%s\n' "$line" >> "$_out"
 			fi
-		done < "$filtered"
-		if [ -s "$filtered.alive" ]; then
-			mv "$filtered.alive" "$filtered"
-			total=$(wc -l < "$filtered" | tr -d ' ')
-		fi
+		done < "$_in"
+	else
+		cp "$_in" "$_out"
+	fi
+	wc -l < "$_out" | tr -d ' '
+}
+
+alive=$(drop_dead "$filtered" "$WORK/kept.ndjson")
+relaxed=0
+
+# 白名单里的节点不够用了（被踢掉或失效），从备用里按订阅顺序补足到 min_pool 个，
+# 否则“白名单 4 个全挂”时订阅再怎么刷新也只会拉回这 4 个，等于没有兜底。
+if [ "$min_pool" -gt 0 ] && [ "$alive" -lt "$min_pool" ] && [ -s "$others" ]; then
+	spare_alive=$(drop_dead "$others" "$WORK/others.alive")
+	if [ "$spare_alive" -gt 0 ]; then
+		relaxed=$((min_pool - alive))
+		head -n "$relaxed" "$WORK/others.alive" >> "$WORK/kept.ndjson"
+		alive=$(wc -l < "$WORK/kept.ndjson" | tr -d ' ')
 	fi
 fi
 
-[ "$total" -gt 0 ] || die "所有节点都在 dead-nodes 名单里（TTL 6 小时），本次不更新"
+if [ "$alive" -gt 0 ]; then
+	mv "$WORK/kept.ndjson" "$filtered"
+	total=$alive
+else
+	# 白名单和备用全在 dead 名单里：保留原节点，别写出空配置让 sing-box 起不来
+	total=$(wc -l < "$filtered" | tr -d ' ')
+	log "所有节点都在 dead 名单内（TTL 6 小时），本次沿用原有 $total 个节点"
+fi
 
 # 超过上限则截断（顺序即订阅顺序，机场通常把好节点排前面）
 if [ "$total" -gt "$MAX_NODES" ]; then
@@ -405,7 +451,7 @@ jq -s '
 [ "$LIST" = "1" ] && { jq -r '.[].tag' "$WORK/nodes.json"; exit 0; }
 
 if [ "$DRY" = "1" ]; then
-	echo "格式=$mode  解析=$parsed  跳过=$skipped  保留=$total  丢弃=$n_drop"
+	echo "格式=$mode  解析=$parsed  跳过=$skipped  保留=$total  丢弃=$n_drop  备用=$n_spare  补位=$relaxed"
 	echo "--- 节点列表 ---"
 	jq -r '.[].tag' "$WORK/nodes.json"
 	exit 0
@@ -457,7 +503,7 @@ sing-box check -c "$WORK/config.new" >/dev/null 2>&1 \
 cp "$CONF" "$CONF.bak.subscribe"
 cp "$WORK/config.new" "$CONF"
 
-log "已更新 $total 个节点（解析 $parsed，跳过 $skipped，筛掉 $n_drop）"
+log "已更新 $total 个节点（解析 $parsed，跳过 $skipped，筛掉 $n_drop，备用 $n_spare，补位 $relaxed）"
 
 # ---------------------------------------------------------------- 生效
 # 回滚：配置语法对、进程也能起来，不代表能用 —— 参数写错（比如漏了 reuse_addr）
