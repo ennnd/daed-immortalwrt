@@ -159,7 +159,18 @@ jobs:
             https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs \
             -o openwrt/files/etc/sing-box/rule-set/geoip-cn.srs
 
-          chmod +x openwrt/files/usr/bin/singbox-on openwrt/files/usr/bin/singbox-off
+          # 执行位：git 里丢了 exec 位、或者 checkout 走了奇怪的文件系统属性，
+          # 都会让 /usr/bin 里出现 644 的脚本 —— cron 调用时只写一条 cron.err，
+          # 看门狗/订阅更新就此静默失效（踩过一次）。这里统一补一遍。
+          chmod +x openwrt/files/usr/bin/singbox-* \
+                   openwrt/files/etc/hotplug.d/iface/99-singbox \
+                   openwrt/files/etc/uci-defaults/99-singbox
+
+          # 顺手做语法检查，坏脚本不要进固件
+          for f in openwrt/files/usr/bin/singbox-* ; do
+            sh -n "$f" || { echo "::error::shell syntax error in $f"; exit 1; }
+          done
+          ls -l openwrt/files/usr/bin/
           ls -l openwrt/files/etc/sing-box/rule-set/
 
       - name: Check node placeholders
@@ -205,7 +216,14 @@ jobs:
             exit 1
           fi
 
-          grep -E '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y|^CONFIG_PACKAGE_sing-box|^CONFIG_PACKAGE_luci-app-singbox|^CONFIG_LUCI_LANG' .config
+          # jq 是 singbox-subscribe / singbox-nodecheck 的硬依赖。
+          # 符号写不存在时 defconfig 同样静默丢弃，编出来的固件功能在、但永远跑不起来。
+          if ! grep -q '^CONFIG_PACKAGE_jq=y' .config; then
+            echo "ERROR: jq is not selected (subscribe/nodecheck need it)" >&2
+            exit 1
+          fi
+
+          grep -E '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y|^CONFIG_PACKAGE_sing-box|^CONFIG_PACKAGE_luci-app-singbox|^CONFIG_PACKAGE_jq|^CONFIG_LUCI_LANG' .config
 
       - name: Build
         run: |

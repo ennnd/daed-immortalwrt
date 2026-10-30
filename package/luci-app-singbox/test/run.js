@@ -93,9 +93,13 @@ if (realCfgText) {
 
 	ok('真实 config.json 剥注释后可解析', parsed != null, err);
 	ok('剥注释后仍是对象', parsed && typeof parsed === 'object');
-	eq('字符串里的 // 没被当注释吃掉',
-		parsed && parsed.outbounds && parsed.outbounds[1] && parsed.outbounds[1].url,
-		'https://www.gstatic.com/generate_204');
+	// 这里验的是“剥注释时没有把字符串里的 // 当成注释起点”，
+	// 所以只断言 URL 结构完整，不绑定具体探测地址 —— 探测目标会随配置演进，
+	// 绑死具体域名的话，换个探测地址就会误报失败（构建 CI 里踩过一次）。
+	ok('字符串里的 // 没被当注释吃掉',
+		!!(parsed && parsed.outbounds && parsed.outbounds[1]
+		   && /^https:\/\/[^/\s]+\/\S+$/.test(String(parsed.outbounds[1].url || ''))),
+		parsed && parsed.outbounds && parsed.outbounds[1] && parsed.outbounds[1].url);
 	eq('rule_set 路径完整',
 		parsed && parsed.route && parsed.route.rule_set[0].path,
 		'/etc/sing-box/rule-set/geosite-cn.srs');

@@ -20,8 +20,9 @@
 #
 # 安全：订阅链接等同于账号密码，脚本不会把它写进日志。
 #
-# 依赖（ImmortalWrt 25.x 已改用 apk；busybox 没有 base64）：
-#   apk add jq coreutils-base64
+# 依赖：jq（ImmortalWrt 25.x 用 apk / opkg 均可，约 250KB）
+#   固件里已经通过 CONFIG_PACKAGE_jq=y 预置；手动装：apk add jq
+#   base64 不依赖外部命令 —— 解码走 jq 的 @base64d（busybox 默认没编 base64）
 
 set -u
 
@@ -50,6 +51,22 @@ done
 
 log() { logger -t "$TAG" "$*"; echo "$*"; }
 die() { logger -t "$TAG" "ERROR: $*"; echo "ERROR: $*" >&2; exit 1; }
+
+b64d() {
+	# base64 解码统一走 jq（@base64d），不依赖 coreutils-base64 ——
+	# 这个固件里 busybox 没编 base64，单独装包又要多 ~250KB 和一条依赖链。
+	# 处理三件事：去换行、把 base64url 的 -_ 换回 +/、补齐 padding。
+	#
+	# 必须先于调用点定义：解析格式（识别 base64 订阅）在第 90 行左右就会用到它，
+	# 放在后面的函数区会报 "b64d: not found"。
+	s=$(printf '%s' "$1" | tr -d '\r\n ' | tr -- '-_' '+/')
+	case $(( ${#s} % 4 )) in
+		2) s="$s==" ;;
+		3) s="$s=" ;;
+	esac
+	printf '%s' "$s" | jq -Rr '@base64d' 2>/dev/null
+}
+
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
@@ -92,7 +109,7 @@ else
 		mode=plain
 		tr -d '\r' < "$raw" | grep '://' > "$uris"
 	else
-		tr -d '\r\n ' < "$raw" | tr -- '-_' '+/' | base64 -d 2>/dev/null > "$WORK/dec" || die "无法识别订阅格式（既不是 JSON/YAML，也不是合法的 base64）"
+		b64d "$(cat "$raw")" > "$WORK/dec"
 		grep '://' "$WORK/dec" > "$uris" 2>/dev/null
 		mode=b64
 	fi
@@ -126,16 +143,6 @@ qval() {
 urld() {
 	# URL 解码（jq 1.8 的 @urid），失败时原样返回
 	printf '%s' "$1" | jq -Rr '@urid' 2>/dev/null || printf '%s' "$1"
-}
-
-b64d() {
-	# 容错 base64 解码：去换行、补 padding、兼容 base64url
-	s=$(printf '%s' "$1" | tr -d '\r\n' | tr -- '-_' '+/')
-	case $(( ${#s} % 4 )) in
-		2) s="$s==" ;;
-		3) s="$s=" ;;
-	esac
-	printf '%s' "$s" | base64 -d 2>/dev/null
 }
 
 parse_vless() {
