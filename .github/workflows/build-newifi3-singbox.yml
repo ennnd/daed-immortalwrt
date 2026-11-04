@@ -223,7 +223,25 @@ jobs:
             exit 1
           fi
 
-          grep -E '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y|^CONFIG_PACKAGE_sing-box|^CONFIG_PACKAGE_luci-app-singbox|^CONFIG_PACKAGE_jq|^CONFIG_LUCI_LANG' .config
+          # 排障工具同理：包名写错（例如 netcat/curl 这类同名易混的）会被静默丢弃，
+          # 刷完机才发现缺，又得靠 apk 现装 —— 而那时常常正是没网要排障的时候。
+          MISSING=""
+          for pkg in coreutils-od coreutils-timeout coreutils-base64 \
+                     socat tcpdump ss lsof strace; do
+            if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "  ok  CONFIG_PACKAGE_${pkg}=y"
+            else
+              echo "MISSING: CONFIG_PACKAGE_${pkg}=y" >&2
+              MISSING="$MISSING $pkg"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::以下排障工具的 CONFIG 符号被 defconfig 丢弃：$MISSING" >&2
+            echo "包名可能不存在于 ImmortalWrt 25.12.2 的 feed（apk search -x <name> 可核对）" >&2
+            exit 1
+          fi
+
+          grep -E '^CONFIG_TARGET_ramips_mt7621_DEVICE_d-team_newifi-d2=y|^CONFIG_PACKAGE_sing-box|^CONFIG_PACKAGE_luci-app-singbox|^CONFIG_PACKAGE_jq|^CONFIG_PACKAGE_(coreutils-od|coreutils-timeout|coreutils-base64|socat|tcpdump|ss|lsof|strace)|^CONFIG_LUCI_LANG' .config
 
       - name: Build
         run: |
@@ -248,6 +266,22 @@ jobs:
           fi
           if ! grep -q 'luci-i18n-singbox' "$M"; then
             echo "::warning::中文语言包没进镜像（面板仍可用，因为源码里的 msgid 就是中文）"
+          fi
+
+          # 排障工具必须在 manifest 里 —— 这是“编出来了但没进 rootfs”唯一便宜的现场证据。
+          echo "--- 排障工具 ---"
+          NOTIN=""
+          for pkg in coreutils-od coreutils-timeout coreutils-base64 \
+                     socat tcpdump ss lsof strace jq; do
+            if grep -qE "^${pkg} " "$M"; then
+              grep -E "^${pkg} " "$M"
+            else
+              NOTIN="$NOTIN $pkg"
+            fi
+          done
+          if [ -n "$NOTIN" ]; then
+            echo "::error::以下包没有进镜像：$NOTIN"
+            exit 1
           fi
 
       # 先上传再检查：万一大小门限没过，固件也不会跟着一起丢掉（省一次 75 分钟重编）
