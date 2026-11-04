@@ -90,7 +90,12 @@ while IFS= read -r tag; do
 	else
 		printf '  %-50s DEAD\n' "$(printf '%s' "$tag" | sed 's/.*@//')"
 		printf '%s\n' "$tag" >> "$WORK/dead.txt"
-		printf '%s\t%s\n' "$tag" "$now" >> "$DEAD"
+		# 同一个 tag 只保留最新一条。不清旧记录的话，同一个节点会累积多条，
+		# TTL 判断会读到较早的时间戳（提前复活或推迟复活），文件也会无限增长
+		# ——2026-11-04 出现过「4 个节点存了 6 条」。
+		awk -F'\t' -v t="$tag" 'NF == 2 && $1 != t' "$DEAD" 2>/dev/null > "$DEAD.tmp" || : > "$DEAD.tmp"
+		printf '%s\t%s\n' "$tag" "$now" >> "$DEAD.tmp"
+		mv "$DEAD.tmp" "$DEAD"
 	fi
 done < "$WORK/nodes.txt"
 

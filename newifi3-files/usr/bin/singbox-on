@@ -141,6 +141,14 @@ if ! pidof sing-box >/dev/null 2>&1; then
 	exit 1
 fi
 
+# ★ sing-box 就绪之后再重启一次 dnsmasq。
+#   上面 ensure_dns 里那次重启发生在 sing-box 启动之前，中间几秒的空窗里
+#   LAN 客户端的查询会走明文上游，把 GFW 的投毒结果缓存进 dnsmasq。
+#   不清这一遍，症状就是「代理明明在跑，google 却解析到假 IP 打不开」——
+#   2026-11-04 那次故障就是这么表现的，重启 dnsmasq 后立刻恢复。
+/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+sleep 1
+
 echo "--- sing-box status ---"
 /etc/init.d/sing-box status || true
 echo "--- last log ---"

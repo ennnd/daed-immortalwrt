@@ -19,91 +19,194 @@
 #
 # 判定表：
 #   国外 OK                  -> 健康，不动作
-#   国外失败 + 国内 OK       -> 代理坏，stop 并退回直连（保住国内网络）
+#   国外失败 + 国内 OK       -> 代理坏，停掉后立即自动抢救，见下
 #   国外失败 + 国内也失败     -> 上行断了，停代理没意义，保持运行等待恢复
+#
+# 自动抢救（2026-11-04 故障后固化）：
+#   以前只停不启，一次临时故障就要人工介入，最短也是“停了就永久停着”。
+#   现在停掉之后立刻执行一次完整抢救，5 分钟后仍不行再执行一次，两次都失败才放弃。
+#   抢救步骤就是当时手工验证有效的那套，缺一不可：
+#     1) 清 dead-nodes —— 陈旧判定会把节点挡在配置外，表现是“起了但没节点可用”
+#     2) 刷新订阅     —— 节点可能真的换了；失败不致命，继续用现有配置
+#     3) singbox-on   —— 重新启用并启动
+#     4) 重启 dnsmasq —— 必须等 sing-box 起来之后再清缓存。代理停着的那段时间
+#                        dnsmasq 用明文上游，早把 GFW 的投毒结果缓存下来了，
+#                        不清就会“代理运行正常但 google 解析到假 IP 打不开”
+#
+# 并发：抢救一共要 8 分钟左右，远超 cron 的 2 分钟周期，所以用 /tmp 下的目录锁
+#   保证同一时刻只有一个实例在跑，后到的直接退出。
 #
 # 宽限期：/tmp/.sb_wd_seen 由 singbox-on 在每次启动时删除，
 #   因此每次启用代理都会重新拿到 GRACE 秒缓冲，不会“刚启动就被判死”。
-#
-# 仅当 sing-box 正在运行才动作；停止后脚本直接退出，不会自启（要手动启用）。
 
 TAG=singbox-watchdog
 STATE=/tmp/.sb_wd_seen
+LOCK=/tmp/.sb_wd_lock
 GRACE=120           # 启动后宽限期（秒）
 TRIES=2
 PAUSE=8             # 每轮探测间隔（秒）
+RETRY_WAIT=300      # 第一次抢救失败后，等多久再试（秒）
 FOREIGN="https://cp.cloudflare.com/generate_204 https://www.gstatic.com/generate_204"
+
+# ---------------------------------------------------------------- 目录锁
+
+acquire_lock() {
+	if mkdir "$LOCK" 2>/dev/null; then
+		echo $$ > "$LOCK/pid"
+		trap 'rm -rf "$LOCK"' EXIT INT TERM
+		return 0
+	fi
+
+	# 锁已存在：持有者可能已经异常退出，检查 pid 还活着没
+	old=$(cat "$LOCK/pid" 2>/dev/null)
+	if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+		return 1
+	fi
+
+	rm -rf "$LOCK"
+	mkdir "$LOCK" 2>/dev/null || return 1
+	echo $$ > "$LOCK/pid"
+	trap 'rm -rf "$LOCK"' EXIT INT TERM
+	return 0
+}
+
+acquire_lock || exit 0
+
+# ---------------------------------------------------------------- 基础探测
 
 pid=$(pidof sing-box)
 if [ -z "$pid" ]; then
-    rm -f "$STATE"
-    exit 0
+	rm -f "$STATE"
+	exit 0
 fi
 
 now=$(date +%s)
 if [ -f "$STATE" ]; then
-    seen=$(cat "$STATE" 2>/dev/null)
-    case "$seen" in
-        ''|*[!0-9]*) seen=$now ;;   # 状态文件损坏时按“刚开始”处理
-    esac
+	seen=$(cat "$STATE" 2>/dev/null)
+	case "$seen" in
+		''|*[!0-9]*) seen=$now ;;   # 状态文件损坏时按“刚开始”处理
+	esac
 else
-    echo "$now" > "$STATE"
-    seen=$now
+	echo "$now" > "$STATE"
+	seen=$now
 fi
 
 if [ $((now - seen)) -lt "$GRACE" ]; then
-    exit 0
+	exit 0
 fi
 
 # 只认 204 空响应：200+HTML（劫持页）、404、连接失败一律算不可用
 probe204() {
-    out=$(wget -O /dev/null -T 8 "$1" 2>&1)
-    rc=$?
+	out=$(wget -O /dev/null -T 8 "$1" 2>&1)
+	rc=$?
 
-    [ "$rc" = "0" ] || return 1
+	[ "$rc" = "0" ] || return 1
 
-    case "$out" in
-        *"0 bytes"*) return 0 ;;
-        *) return 1 ;;
-    esac
+	case "$out" in
+		*"0 bytes"*) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 foreign_ok=0
 hit=""
 i=1
 while [ "$i" -le "$TRIES" ]; do
-    for t in $FOREIGN; do
-        if probe204 "$t"; then
-            foreign_ok=1
-            hit=$t
-            break
-        fi
-    done
-    [ "$foreign_ok" = "1" ] && break
-    sleep "$PAUSE"
-    i=$((i + 1))
+	for t in $FOREIGN; do
+		if probe204 "$t"; then
+			foreign_ok=1
+			hit=$t
+			break
+		fi
+	done
+	[ "$foreign_ok" = "1" ] && break
+	sleep "$PAUSE"
+	i=$((i + 1))
 done
 
 if [ "$foreign_ok" = "1" ]; then
-    logger -t "$TAG" "foreign OK via $hit, sing-box healthy"
-    exit 0
+	logger -t "$TAG" "foreign OK via $hit, sing-box healthy"
+	exit 0
 fi
 
 domestic_ok=0
 i=1
 while [ "$i" -le "$TRIES" ]; do
-    if wget -q -O /dev/null -T 8 http://www.baidu.com 2>/dev/null; then
-        domestic_ok=1
-        break
-    fi
-    sleep "$PAUSE"
-    i=$((i + 1))
+	if wget -q -O /dev/null -T 8 http://www.baidu.com 2>/dev/null; then
+		domestic_ok=1
+		break
+	fi
+	sleep "$PAUSE"
+	i=$((i + 1))
 done
 
-if [ "$domestic_ok" = "1" ]; then
-    logger -t "$TAG" "foreign UNREACHABLE (no 204) but domestic OK -> proxy broken, stopping sing-box"
-    /usr/bin/singbox-safestop
-else
-    logger -t "$TAG" "both foreign and domestic down -> uplink outage, leave sing-box (avoid flapping)"
+if [ "$domestic_ok" != "1" ]; then
+	logger -t "$TAG" "both foreign and domestic down -> uplink outage, leave sing-box (avoid flapping)"
+	exit 0
 fi
-exit 0
+
+# ---------------------------------------------------------------- 代理故障：停 + 抢救
+
+logger -t "$TAG" "foreign UNREACHABLE (no 204) but domestic OK -> proxy broken, stopping sing-box"
+/usr/bin/singbox-safestop
+
+# 抢救后确认“真的能用了”，不只看进程在不在
+recover_ok() {
+	pidof sing-box >/dev/null 2>&1 || return 1
+
+	i=0
+	while [ "$i" -lt 3 ]; do
+		for t in $FOREIGN; do
+			probe204 "$t" && return 0
+		done
+		sleep 5
+		i=$((i + 1))
+	done
+	return 1
+}
+
+recover_once() {
+	logger -t "$TAG" "recovery: clear dead list, refresh subscription, restart sing-box"
+
+	# 1) 陈旧判定会把节点挡在配置外
+	: > /etc/sing-box/dead-nodes 2>/dev/null || true
+
+	# 2) 节点可能真换了；订阅拉不到也不影响后面用现有节点启动
+	/usr/bin/singbox-subscribe >/dev/null 2>&1 \
+		|| logger -t "$TAG" "recovery: subscription refresh failed, keep current nodes"
+
+	# 3) 重新启用并启动
+	/usr/bin/singbox-on >/dev/null 2>&1 || true
+
+	sleep 5
+
+	# 4) 关键：等 sing-box 就绪之后再清 dnsmasq 缓存，顺序反了会再缓存一次投毒结果
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+
+	sleep 3
+}
+
+give_up() {
+	logger -t "$TAG" "recovery failed twice, leaving sing-box stopped (manual enable required)"
+	/usr/bin/singbox-safestop >/dev/null 2>&1 || true
+	exit 0
+}
+
+recover_once
+if recover_ok; then
+	logger -t "$TAG" "recovered on first attempt (proxy is up again)"
+	rm -f "$STATE"
+	exit 0
+fi
+
+logger -t "$TAG" "first recovery attempt failed, retry in ${RETRY_WAIT}s"
+sleep "$RETRY_WAIT"
+
+recover_once
+if recover_ok; then
+	logger -t "$TAG" "recovered on second attempt (after ${RETRY_WAIT}s)"
+	rm -f "$STATE"
+	exit 0
+fi
+
+give_up
